@@ -144,6 +144,7 @@ function App() {
   const [roomCode, setRoomCode] = useState('');
   const [botThinking, setBotThinking] = useState<string | null>(null);
   const [isFullscreen, setIsFullscreen] = useState(false);
+  const [isRejoining, setIsRejoining] = useState(false);
   void gameStarted; // Used by game_started socket event
 
   // UI state
@@ -285,16 +286,21 @@ function App() {
       // Attempt to rejoin if we have a saved gameId
       const savedGameId = localStorage.getItem('catan_game_id');
       if (savedGameId) {
+        setIsRejoining(true);
         s.emit('rejoin_game', { userId: authUser.id, gameId: savedGameId });
+        
+        // Safety timeout: if server doesn't respond in 6s, let user play normally
+        setTimeout(() => setIsRejoining(false), 6000);
       }
     });
     s.on('disconnect', () => setIsConnected(false));
     s.on('game_joined', (data) => {
+      setIsRejoining(false);
       setCurrentGameId(data.gameId);
       setRoomCode(data.roomCode);
       localStorage.setItem('catan_game_id', data.gameId);
       localStorage.setItem('catan_room_code', data.roomCode);
-      setView('GAME');
+      setView('LOBBY');
     });
     s.on('lobbies_update', (l: any[]) => setLobbies(l));
     s.on('board_state', (data: any) => {
@@ -349,15 +355,30 @@ function App() {
       
       // Save deep copy of all players for accurate deltas
       prevPlayersRef.current = JSON.parse(JSON.stringify(st.players));
+
+      // Persistence: Auto-switch to GAME view if we refresh into an active match
+      if (st.phase !== 'LOBBY' && view !== 'GAME') {
+        setView('GAME');
+      }
+      setIsRejoining(false);
     });
     s.on('bot_thinking', (d: { userId: string }) => {
       setBotThinking(d.userId);
     });
     s.on('game_started', () => {
+      setIsRejoining(false);
       setGameStarted(true);
       setView('GAME');
     });
-    s.on('action_error', (msg: string) => { setErrorMsg(msg); setTimeout(() => setErrorMsg(null), 3000); });
+    s.on('action_error', (msg: string) => { 
+      setIsRejoining(false);
+      if (msg.toLowerCase().includes('not found')) {
+        localStorage.removeItem('catan_game_id');
+        localStorage.removeItem('catan_room_code');
+      }
+      setErrorMsg(msg); 
+      setTimeout(() => setErrorMsg(null), 3000); 
+    });
     return () => { s.close(); };
   }, [authUser]);
 
@@ -1171,6 +1192,32 @@ function App() {
           </div>
         )}
       </div>
+
+      <AnimatePresence>
+        {isRejoining && (
+          <motion.div 
+            className="rejoin-overlay"
+            initial={{ opacity: 0 }}
+            animate={{ opacity: 1 }}
+            exit={{ opacity: 0 }}
+          >
+            <div className="rejoin-content">
+              <div className="golden-spinner"></div>
+              <h1>Rejoining your Legend...</h1>
+              <p>Restoring your throne on the island of Catan</p>
+              
+              {/* Emergency button if it takes too long */}
+              <button 
+                className="btn-action btn-ghost" 
+                style={{ marginTop: '2rem', fontSize: '0.8rem', opacity: 0.6 }}
+                onClick={() => setIsRejoining(false)}
+              >
+                Enter anyway
+              </button>
+            </div>
+          </motion.div>
+        )}
+      </AnimatePresence>
     </div>
   );
 }

@@ -1410,3 +1410,54 @@ h1 {
   font-weight: 900;
   color: var(--accent);
 }
+
+/* ═══════════════════════════════════════════════════════════
+   REJOIN OVERLAY (PERSISTENCE)
+   ═══════════════════════════════════════════════════════════ */
+
+.rejoin-overlay {
+  position: fixed;
+  top: 0;
+  left: 0;
+  width: 100vw;
+  height: 100vh;
+  z-index: 100000; /* Above everything */
+  background: rgba(10, 20, 40, 0.85);
+  backdrop-filter: blur(15px);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: white;
+  text-align: center;
+}
+
+.rejoin-content h1 {
+  font-family: 'Outfit', sans-serif;
+  font-size: 2.5rem;
+  margin-top: 1.5rem;
+  background: linear-gradient(135deg, #fff 0%, var(--accent) 100%);
+  -webkit-background-clip: text;
+  -webkit-text-fill-color: transparent;
+}
+
+.rejoin-content p {
+  color: var(--text-dim);
+  font-size: 1.1rem;
+}
+
+.golden-spinner {
+  width: 80px;
+  height: 80px;
+  border: 4px solid rgba(255, 215, 0, 0.1);
+  border-top: 4px solid var(--accent);
+  border-radius: 50%;
+  margin: 0 auto;
+  animation: spin 1.5s cubic-bezier(0.68, -0.55, 0.27, 1.55) infinite;
+  box-shadow: 0 0 20px rgba(255, 215, 0, 0.2);
+}
+
+@keyframes spin {
+  0% { transform: rotate(0deg); }
+  100% { transform: rotate(360deg); }
+}
+
