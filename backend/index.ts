@@ -260,6 +260,26 @@ io.on('connection', (socket) => {
     io.to(game.id).emit('game_state', result.engine.getState());
   });
 
+  socket.on('rejoin_game', async (data) => {
+    const { userId, gameId } = data;
+    logger.info(`Rejoin attempt: User ${userId} for Game ${gameId}`);
+
+    const result = await getOrInitGame(gameId);
+    if (!result) {
+      socket.emit('action_error', 'Game session not found');
+      return;
+    }
+
+    const gameRecord = await prisma.game.findUnique({ where: { id: gameId } });
+    if (!gameRecord) return;
+
+    socket.join(gameId);
+    socket.emit('board_state', result.board);
+    socket.emit('game_joined', { gameId, roomCode: gameRecord.roomCode });
+    socket.emit('game_state', result.engine.getState());
+    logger.info(`Success: User ${userId} rejoined Game ${gameId}`);
+  });
+
   socket.on('join_game', async (data) => {
     logger.info(`Player ${data.userId} joining ${data.gameId}`);
     socket.join(data.gameId);

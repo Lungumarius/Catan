@@ -262,6 +262,7 @@ function App() {
       const data = await res.json();
       if (data.success) {
         localStorage.setItem('catan_token', data.token);
+        localStorage.setItem('catan_user', JSON.stringify(data.user));
         setAuthUser(data.user);
         setView('MATCHMAKING');
       } else {
@@ -278,7 +279,23 @@ function App() {
     if (!authUser) return;
     const s = io(API);
     setSocket(s);
-    s.on('connect', () => { setIsConnected(true); s.emit('fetch_lobbies'); });
+
+    s.on('connect', () => {
+      setIsConnected(true);
+      // Attempt to rejoin if we have a saved gameId
+      const savedGameId = localStorage.getItem('catan_game_id');
+      if (savedGameId) {
+        s.emit('rejoin_game', { userId: authUser.id, gameId: savedGameId });
+      }
+    });
+    s.on('disconnect', () => setIsConnected(false));
+    s.on('game_joined', (data) => {
+      setCurrentGameId(data.gameId);
+      setRoomCode(data.roomCode);
+      localStorage.setItem('catan_game_id', data.gameId);
+      localStorage.setItem('catan_room_code', data.roomCode);
+      setView('GAME');
+    });
     s.on('lobbies_update', (l: any[]) => setLobbies(l));
     s.on('board_state', (data: any) => {
       if (data.hexes) {
@@ -340,13 +357,7 @@ function App() {
       setGameStarted(true);
       setView('GAME');
     });
-    s.on('game_joined', (d: { gameId: string; roomCode?: string }) => {
-      setCurrentGameId(d.gameId);
-      if (d.roomCode) setRoomCode(d.roomCode);
-      setView('LOBBY');
-    });
     s.on('action_error', (msg: string) => { setErrorMsg(msg); setTimeout(() => setErrorMsg(null), 3000); });
-    s.on('disconnect', () => setIsConnected(false));
     return () => { s.close(); };
   }, [authUser]);
 
@@ -430,6 +441,9 @@ function App() {
 
   const logout = () => {
     localStorage.removeItem('catan_token');
+    localStorage.removeItem('catan_user');
+    localStorage.removeItem('catan_game_id');
+    localStorage.removeItem('catan_room_code');
     setAuthUser(null);
     setView('AUTH');
     socket?.close();
@@ -710,7 +724,7 @@ function App() {
       {gs?.winner && (
         <div className="victory-overlay">
           <motion.div className="glass-panel victory-card" initial={{ scale: 0 }} animate={{ scale: 1 }}>
-            <h1>🏆 {gs.winner === userId ? 'YOU WIN!' : `Player ${pIdx(gs.winner)} Wins!`}</h1>
+            <h1>🏆 {gs.winner === userId ? 'YOU WIN!' : `${gs.players[gs.winner]?.username || 'Player'} Wins!`}</h1>
             <p style={{ fontSize: '1.2rem', marginBottom: '1rem' }}>{totalVP()} Victory Points</p>
             <button className="btn-action btn-lg" onClick={() => setView('MATCHMAKING')}>Back to Lobby</button>
           </motion.div>

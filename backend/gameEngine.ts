@@ -288,7 +288,7 @@ export class GameEngine {
           this.phase = 'MAIN_GAME';
           this.turnPhase = 'MUST_ROLL';
           this.currentTurnIndex = 0;
-          this.addLog('🎮 Main game begins! Player 1 rolls first.');
+          this.addLog(`🎮 Main game begins! ${this.playerName(this.playerOrder[0])} rolls first.`);
         }
       }
     }
