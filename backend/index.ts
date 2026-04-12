@@ -115,9 +115,13 @@ async function handleAction(
     return;
   }
 
-  const newState = result.engine.getState();
-  await saveCheckpoint(gameId);
-  io.to(gameId).emit('game_state', newState);
+  const engineState = result.engine.getState();
+  const gameRecord = await prisma.game.findUnique({ where: { id: gameId }, select: { status: true } });
+
+  io.to(gameId).emit('game_state', { 
+    ...engineState, 
+    status: gameRecord?.status || 'LOBBY' 
+  });
 
   // Auto-trigger next bot if applicable
   checkForBotTurn(gameId);

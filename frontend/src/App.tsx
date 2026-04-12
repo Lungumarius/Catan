@@ -21,6 +21,7 @@ interface Building { owner: string; type: 'settlement' | 'city'; }
 interface TradeOffer { fromPlayer: string; offering: Partial<Resources>; requesting: Partial<Resources>; }
 
 export interface GameState {
+  status?: string;
   phase: string; turnPhase: string; setupTurnIndex: number;
   players: Record<string, PlayerState>; playerOrder: string[];
   currentTurnIndex: number; diceResult: number | null; dice1: number; dice2: number;
@@ -144,7 +145,7 @@ function App() {
   const [roomCode, setRoomCode] = useState('');
   const [botThinking, setBotThinking] = useState<string | null>(null);
   const [isFullscreen, setIsFullscreen] = useState(false);
-  const [isRejoining, setIsRejoining] = useState(false);
+  const [isRejoining, setIsRejoining] = useState(!!localStorage.getItem('catan_game_id'));
   void gameStarted; // Used by game_started socket event
 
   // UI state
@@ -244,8 +245,11 @@ function App() {
         .then(r => r.json())
         .then(data => {
           if (data.id) { setAuthUser(data); setView('MATCHMAKING'); }
+          else { setIsRejoining(false); }
         })
-        .catch(() => {});
+        .catch(() => { setIsRejoining(false); });
+    } else {
+      setIsRejoining(false);
     }
   }, []);
 
@@ -356,8 +360,8 @@ function App() {
       // Save deep copy of all players for accurate deltas
       prevPlayersRef.current = JSON.parse(JSON.stringify(st.players));
 
-      // Persistence: Auto-switch to GAME view if we refresh into an active match
-      if (st.phase !== 'LOBBY' && view !== 'GAME') {
+      // Persistence Fix: Only auto-switch to GAME view if the game has explicitly STARTED
+      if (st.status === 'STARTED' && view !== 'GAME') {
         setView('GAME');
       }
       setIsRejoining(false);
