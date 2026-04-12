@@ -19,6 +19,7 @@ export interface DevCard {
 
 export interface Player {
   id: string;
+  username: string;
   color: string;
   resources: Resources;
   score: number;
@@ -118,6 +119,8 @@ export class GameEngine {
   diceResult: number | null = null;
   dice1: number = 0;
   dice2: number = 0;
+  rollCount: number = 0;
+  lastDiceYields: Record<string, ResourceType[]> = {};
 
   // Board pieces
   buildings: Record<string, Building> = {};  // vertexId → Building
@@ -143,6 +146,7 @@ export class GameEngine {
   board: HexagonState[] = [];
   ports: Port[] = [];
   adjacencyMap: Record<string, string[]> = {}; // Vertex ID -> Array of Neighbor Vertex IDs
+  interiorVertices: Set<string> = new Set(); // Vertices that touch 3+ hexes (valid for setup)
   
   // Track order of setup placements to ensure resources are given correctly
   setupSettlements: { playerId: string, vertexId: string }[] = [];
@@ -164,8 +168,9 @@ export class GameEngine {
     this.board = board;
     this.ports = ports;
     
-    // Build adjacency map
+    // Build adjacency map + count how many hexes each vertex touches
     this.adjacencyMap = {};
+    const vertexHexCount: Record<string, number> = {};
     board.forEach(hex => {
       const { x, y } = getPixelPos(hex.q, hex.r);
       const verts = getVerticesForHex(x, y);
@@ -176,8 +181,18 @@ export class GameEngine {
         if (!this.adjacencyMap[v2]) this.adjacencyMap[v2] = [];
         if (!this.adjacencyMap[v1].includes(v2)) this.adjacencyMap[v1].push(v2);
         if (!this.adjacencyMap[v2].includes(v1)) this.adjacencyMap[v2].push(v1);
+        vertexHexCount[v1] = (vertexHexCount[v1] || 0);
+        vertexHexCount[v2] = (vertexHexCount[v2] || 0);
       }
+      // Count each vertex of this hex
+      verts.forEach(v => { vertexHexCount[v] = (vertexHexCount[v] || 0) + 1; });
     });
+
+    // Interior vertices = those touching 3 hexes (classic Catan rule)
+    this.interiorVertices = new Set();
+    for (const [vid, count] of Object.entries(vertexHexCount)) {
+      if (count >= 3) this.interiorVertices.add(vid);
+    }
 
     // Place robber on desert
     const desert = board.find(h => h.type === 'desert');
@@ -191,14 +206,23 @@ export class GameEngine {
     Object.assign(this, state);
   }
 
-  addPlayer(userId: string, isBot: boolean = false): string | null {
+  addPlayer(userId: string, username: string = '', isBot: boolean = false): string | null {
     if (this.players[userId]) return null;
     if (this.playerOrder.length >= 4) return 'Game is full (max 4 players)';
     if (this.phase !== 'SETUP_R1' || this.setupTurnIndex > 0) return 'Game already started';
 
     const colors = ['#ef4444', '#3b82f6', '#22c55e', '#f97316'];
+    const botNames = ['Gandalf', 'Saruman', 'Vader', 'Sauron', 'Gollum', 'Yoda'];
+    let finalUsername = username;
+    if (isBot && !finalUsername) {
+      finalUsername = botNames[Math.floor(Math.random() * botNames.length)] + ` (Bot)`;
+    } else if (!finalUsername) {
+      finalUsername = `Player ${this.playerOrder.length + 1}`;
+    }
+
     this.players[userId] = {
       id: userId,
+      username: finalUsername,
       color: colors[this.playerOrder.length],
       resources: { wood: 0, brick: 0, sheep: 0, wheat: 0, ore: 0 },
       score: 0,
@@ -315,6 +339,11 @@ export class GameEngine {
     if (this.phase === 'SETUP_R1' || this.phase === 'SETUP_R2') {
       if (this.getSetupCurrentPlayer() !== userId) return 'Not your turn in setup';
       if (this.getSetupExpectedAction() !== 'settlement') return 'Place a road first';
+
+      // Block edge vertices — setup settlements must be on interior intersections (touching 3 hexes)
+      if (!this.interiorVertices.has(vertexId)) {
+        return 'Cannot place on the edge of the island — must be at an interior intersection';
+      }
 
       this.buildings[vertexId] = { owner: userId, type: 'settlement' };
       this.setupSettlements.push({ playerId: userId, vertexId });
@@ -497,6 +526,10 @@ export class GameEngine {
   // ─────────────────────────────────────────
 
   private distributeResources(roll: number) {
+    this.rollCount++;
+    this.lastDiceYields = {};
+    for (const pid of this.playerOrder) this.lastDiceYields[pid] = [];
+
     this.board.forEach(hex => {
       if (hex.number !== roll) return;
       // Skip hex with robber
@@ -513,6 +546,9 @@ export class GameEngine {
         if (building && this.players[building.owner]) {
           const amount = building.type === 'city' ? 2 : 1;
           this.players[building.owner].resources[res] += amount;
+          for (let i = 0; i < amount; i++) {
+            this.lastDiceYields[building.owner].push(res);
+          }
         }
       });
     });
@@ -592,6 +628,21 @@ export class GameEngine {
 
     this.turnPhase = 'FREE_ACTION';
     return null;
+  }
+
+  // Returns player IDs (excluding excludePlayer) who have buildings on hex
+  getPlayersOnHex(hexCoord: string, excludePlayer: string): string[] {
+    const [q, r] = hexCoord.split(',').map(Number);
+    const { x, y } = getPixelPos(q, r);
+    const verts = getVerticesForHex(x, y);
+    const players = new Set<string>();
+    verts.forEach(v => {
+      const bld = this.buildings[v];
+      if (bld && bld.owner !== excludePlayer && this.totalResources(this.players[bld.owner]) > 0) {
+        players.add(bld.owner);
+      }
+    });
+    return Array.from(players);
   }
 
   private stealRandomResource(victim: Player): ResourceType | null {
@@ -1181,13 +1232,14 @@ export class GameEngine {
     return Object.values(p.resources).reduce((a, b) => a + b, 0);
   }
 
-  private playerName(userId: string): string {
+  public playerName(userId: string): string {
     const idx = this.playerOrder.indexOf(userId);
     const p = this.players[userId];
-    return p ? (p.isBot ? `🤖 ${userId.substring(0, 5)}` : `Player ${idx + 1}`) : `Player ${idx + 1}`;
+    if (p && p.username) return p.isBot ? `🤖 ${p.username}` : p.username;
+    return `Player ${idx + 1}`;
   }
 
-  private addLog(msg: string) {
+  public addLog(msg: string) {
     this.log.push(msg);
     if (this.log.length > 100) this.log.shift();
   }

@@ -1,8 +1,9 @@
-import { useEffect, useState, useCallback } from 'react';
+import { useEffect, useState, useCallback, useRef } from 'react';
 import { io, Socket } from 'socket.io-client';
 import { motion, AnimatePresence } from 'framer-motion';
 import { Board, type HexData, type PortData } from './Board';
 import './App.css';
+import musicFile from './music.mp3?url';
 
 const API = import.meta.env.VITE_API_URL || 'http://localhost:3000';
 const COLORS = ['#ef4444', '#3b82f6', '#22c55e', '#f97316'];
@@ -12,7 +13,7 @@ type ResourceType = 'wood' | 'brick' | 'sheep' | 'wheat' | 'ore';
 type Resources = Record<ResourceType, number>;
 interface DevCard { type: string; boughtThisTurn: boolean; }
 interface PlayerState {
-  id: string; color: string; score: number; resources: Resources;
+  id: string; username: string; color: string; score: number; resources: Resources;
   devCards: DevCard[]; knightsPlayed: number; hasPlayedDevCardThisTurn: boolean;
   isBot: boolean;
 }
@@ -23,6 +24,7 @@ export interface GameState {
   phase: string; turnPhase: string; setupTurnIndex: number;
   players: Record<string, PlayerState>; playerOrder: string[];
   currentTurnIndex: number; diceResult: number | null; dice1: number; dice2: number;
+  rollCount: number; lastDiceYields: Record<string, ResourceType[]>;
   buildings: Record<string, Building>; roads: Record<string, string>;
   robberHex: string; playersWhoMustDiscard: string[];
   devCardDeckSize: number;
@@ -141,6 +143,7 @@ function App() {
   const [joinCode, setJoinCode] = useState('');
   const [roomCode, setRoomCode] = useState('');
   const [botThinking, setBotThinking] = useState<string | null>(null);
+  const [isFullscreen, setIsFullscreen] = useState(false);
   void gameStarted; // Used by game_started socket event
 
   // UI state
@@ -159,11 +162,78 @@ function App() {
   const [showDiceAnim, setShowDiceAnim] = useState(false);
   const [animDice, setAnimDice] = useState({ d1: 1, d2: 1, total: 2 });
 
+  // Fullscreen: real browser API
+  const gameLayoutRef = useRef<HTMLDivElement>(null);
+  const audioRef = useRef<HTMLAudioElement | null>(null);
+  const [musicStarted, setMusicStarted] = useState(false);
+  const [devCardAction, setDevCardAction] = useState<{ index: number, type: string } | null>(null);
+  const [devRes1, setDevRes1] = useState<ResourceType>('wood');
+  const [devRes2, setDevRes2] = useState<ResourceType>('wheat');
+
+  // Robber steal picker
+  const [stealTargets, setStealTargets] = useState<string[]>([]);
+  const [pendingRobberHex, setPendingRobberHex] = useState<string | null>(null);
+
+  // Universal Physical Card Animations
+  const [globalFlies, setGlobalFlies] = useState<{ id: number; pid: string; res: string; amount: number; isGain: boolean }[]>([]);
+  const prevPlayersRef = useRef<Record<string, PlayerState> | null>(null);
+  const flyIdRef = useRef(0);
+
+  useEffect(() => {
+    const handleKey = (e: KeyboardEvent) => {
+      if (e.key === 'Escape' && isFullscreen) {
+        if (document.fullscreenElement) document.exitFullscreen();
+        setIsFullscreen(false);
+      }
+      if (e.key === 'f' && !e.ctrlKey && !e.metaKey && view === 'GAME') {
+        const active = document.activeElement?.tagName;
+        if (active !== 'INPUT' && active !== 'TEXTAREA') {
+          toggleFullscreen();
+        }
+      }
+    };
+    window.addEventListener('keydown', handleKey);
+    return () => window.removeEventListener('keydown', handleKey);
+  }, [view, isFullscreen]);
+
+  function toggleFullscreen() {
+    if (!isFullscreen) {
+      gameLayoutRef.current?.requestFullscreen?.();
+      setIsFullscreen(true);
+    } else {
+      if (document.fullscreenElement) document.exitFullscreen();
+      setIsFullscreen(false);
+    }
+  }
+
+  // Background music
+  useEffect(() => {
+    const audio = new Audio(musicFile);
+    audio.loop = true;
+    audio.volume = 0.3;
+    audioRef.current = audio;
+    return () => { audio.pause(); audio.src = ''; };
+  }, []);
+
+  function startMusic() {
+    if (!musicStarted && audioRef.current) {
+      audioRef.current.play().catch(() => {});
+      setMusicStarted(true);
+    }
+  }
+
+  // ── Global Auto-Play Music on initial interaction ──
+  useEffect(() => {
+    const handleGlobalClick = () => startMusic();
+    document.addEventListener('click', handleGlobalClick);
+    return () => document.removeEventListener('click', handleGlobalClick);
+  }, [musicStarted]);
+
   const userId = authUser?.id ?? '';
 
   const emit = useCallback((event: string, payload: any = {}) => {
-    socket?.emit(event, { ...payload, gameId: currentGameId, userId });
-  }, [socket, currentGameId, userId]);
+    socket?.emit(event, { ...payload, gameId: currentGameId, userId, username: authUser?.username });
+  }, [socket, currentGameId, userId, authUser]);
 
   // ── Check stored token on mount ──
   useEffect(() => {
@@ -228,6 +298,40 @@ function App() {
         }
         return st;
       });
+
+      // Universal Physical Card Animations: detect gains and losses for ALL players
+      if (prevPlayersRef.current) {
+        const prevP = prevPlayersRef.current;
+        const flies: { id: number; pid: string; res: string; amount: number; isGain: boolean }[] = [];
+        
+        for (const pid of st.playerOrder) {
+          const myRes = st.players[pid]?.resources;
+          const oldRes = prevP[pid]?.resources;
+          if (myRes && oldRes) {
+            for (const r of ['wood','brick','sheep','wheat','ore'] as ResourceType[]) {
+              const diff = myRes[r] - (oldRes[r] || 0);
+              if (diff !== 0) {
+                flies.push({ id: flyIdRef.current++, pid, res: r, amount: Math.abs(diff), isGain: diff > 0 });
+              }
+            }
+          }
+        }
+        
+        if (flies.length > 0) {
+          // If a dice roll just happened, wait for the animation to finish (~2s)
+          const delay = (st.diceResult && (!prevP || !prevP[authUser.id]) && st.diceResult !== (gameState?.diceResult)) ? 2200 : 0;
+          
+          setTimeout(() => {
+            setGlobalFlies(f => [...f, ...flies]);
+            setTimeout(() => {
+              setGlobalFlies(f => f.filter(x => !flies.some(y => y.id === x.id)));
+            }, 3500);
+          }, delay);
+        }
+      }
+      
+      // Save deep copy of all players for accurate deltas
+      prevPlayersRef.current = JSON.parse(JSON.stringify(st.players));
     });
     s.on('bot_thinking', (d: { userId: string }) => {
       setBotThinking(d.userId);
@@ -276,7 +380,52 @@ function App() {
     if (buildMode === 'road' || (gs?.roadBuildingRemaining ?? 0) > 0) { emit('place_road', { edgeId: eid }); if (buildMode === 'road') setBuildMode(null); }
   };
   const handleHexClick = (hc: string) => {
-    if (gs?.turnPhase === 'ROBBER_MOVE' && isMyTurn) emit('move_robber', { hexCoord: hc, stealFrom: null });
+    if (gs?.turnPhase === 'ROBBER_MOVE' && isMyTurn) {
+      // Find players with buildings on this hex to allow steal picker
+      const hexQ = parseInt(hc.split(',')[0]);
+      const hexR = parseInt(hc.split(',')[1]);
+      const HEX_WIDTH = 200;
+      const SIZE = 115.47;
+      const cx = HEX_WIDTH * (hexQ + hexR / 2);
+      const cy = SIZE * 1.5 * hexR;
+      const hexVerts: string[] = [];
+      for (let i = 0; i < 6; i++) {
+        const a = Math.PI / 180 * (30 + 60 * i);
+        hexVerts.push(`${Math.round(cx + SIZE * Math.cos(a))},${Math.round(cy + SIZE * Math.sin(a))}`);
+      }
+      const targets = new Set<string>();
+      hexVerts.forEach(v => {
+        const bld = gs?.buildings[v];
+        if (bld && bld.owner !== userId) targets.add(bld.owner);
+      });
+      const targetList = Array.from(targets);
+      
+      if (targetList.length === 0) {
+        // No one to steal from
+        emit('move_robber', { hexCoord: hc, stealFrom: null });
+      } else if (targetList.length === 1) {
+        // Auto-steal from the only player
+        emit('move_robber', { hexCoord: hc, stealFrom: targetList[0] });
+      } else {
+        // Show picker modal
+        setPendingRobberHex(hc);
+        setStealTargets(targetList);
+      }
+    }
+  };
+
+  const getBestBankRate = (offerRes: ResourceType) => {
+    if (!gs) return 4;
+    let rate = 4;
+    const myBuildings = Object.keys(gs.buildings).filter(v => gs.buildings[v].owner === userId);
+    for (const port of boardState.ports) {
+      const hasAccess = port.vertices.some(pv => myBuildings.includes(pv));
+      if (hasAccess) {
+        if (port.type === 'generic' && rate > 3) rate = 3;
+        if (port.type === offerRes && rate > 2) rate = 2;
+      }
+    }
+    return rate;
   };
 
   const logout = () => {
@@ -425,10 +574,10 @@ function App() {
                     <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
                       <div>
                         <div className="slot-name" style={{ color: COLORS[i] }}>
-                          {gs?.players[pid]?.isBot ? '🤖 Bot' : COLOR_NAMES[i]} {isYou ? '(You)' : ''}
+                          {gs?.players[pid]?.username || COLOR_NAMES[i]} {isYou ? '(You)' : ''}
                         </div>
                         <div style={{ fontSize: '0.7rem', color: 'var(--text-dim)' }}>
-                          {pid.substring(0, 8)} {i === 0 ? '👑 Host' : ''}
+                          {gs?.players[pid]?.isBot ? 'Legendary Opponent' : 'Human Player'} {i === 0 ? '👑 Host' : ''}
                         </div>
                       </div>
                     </div>
@@ -471,7 +620,7 @@ function App() {
   const expectedAction = gs?.setupInfo?.expectedAction;
 
   return (
-    <div className="game-layout">
+    <div className={`game-layout ${isFullscreen ? 'fullscreen-mode' : ''}`} ref={gameLayoutRef} onClick={startMusic}>
       {/* DICE ROLL ANIMATION */}
       <AnimatePresence>
         {showDiceAnim && (
@@ -488,6 +637,74 @@ function App() {
           </motion.div>
         )}
       </AnimatePresence>
+
+
+
+      {/* ROBBER STEAL PICKER */}
+      {pendingRobberHex && stealTargets.length > 0 && (
+        <div className="steal-picker-overlay">
+          <motion.div className="steal-picker-card" initial={{ scale: 0.8, opacity: 0 }} animate={{ scale: 1, opacity: 1 }}>
+            <h3>🏴‍☠️ Choose who to steal from</h3>
+            <div className="steal-targets">
+              {stealTargets.map(pid => {
+                const player = gs?.players[pid];
+                const idx = gs?.playerOrder.indexOf(pid) ?? 0;
+                return (
+                  <button key={pid} className="steal-target-btn"
+                    onClick={() => {
+                      emit('move_robber', { hexCoord: pendingRobberHex, stealFrom: pid });
+                      setPendingRobberHex(null);
+                      setStealTargets([]);
+                    }}>
+                    <div className="steal-dot" style={{ backgroundColor: player?.color }} />
+                    <span>Player {idx + 1}</span>
+                  </button>
+                );
+              })}
+            </div>
+          </motion.div>
+        </div>
+      )}
+
+      {/* PERSONAL TEXT FLY-IN (+1 🌾) */}
+      <AnimatePresence>
+        {globalFlies.filter(f => f.pid === userId).map((fly, i) => (
+          <motion.div key={`text-${fly.id}`}
+            initial={{ opacity: 1, y: 0, x: 0, scale: 1.2 }}
+            animate={{ opacity: 0, y: -80, scale: 0.6 }}
+            exit={{ opacity: 0 }}
+            transition={{ duration: 1.8, ease: 'easeOut' }}
+            style={{ 
+              top: `${50 + i * 10}%`, 
+              right: '320px', 
+              position: 'absolute', 
+              zIndex: 9600,
+              pointerEvents: 'none'
+            }}>
+            <span style={{ 
+              color: fly.isGain ? '#a7f3d0' : '#fca5a5', 
+              fontWeight: 800, 
+              fontSize: '1.5rem',
+              background: 'rgba(0,0,0,0.7)',
+              padding: '6px 14px',
+              borderRadius: '20px',
+              border: '1px solid rgba(255,255,255,0.1)',
+              boxShadow: '0 4px 10px rgba(0,0,0,0.5)'
+            }}>
+              {fly.isGain ? '+' : '-'}{fly.amount} {RES[fly.res as ResourceType]}
+            </span>
+          </motion.div>
+        ))}
+      </AnimatePresence>
+
+      {/* DEV CHEAT BUTTON */}
+      {gs?.phase === 'MAIN_GAME' && (
+        <button 
+          onClick={() => socket?.emit('cheat_resources', { gameId: currentGameId, userId })}
+          style={{ position: 'absolute', bottom: 20, left: 20, zIndex: 9999, padding: '10px 15px', background: 'deeppink', color: 'white', fontWeight: 900, borderRadius: '8px', cursor: 'pointer', border: 'none', boxShadow: '0 4px 10px rgba(255, 20, 147, 0.5)' }}>
+          🛠️ DEV: +99 RES 
+        </button>
+      )}
 
       {/* VICTORY */}
       {gs?.winner && (
@@ -510,20 +727,87 @@ function App() {
           </span>
         </div>
         <div className="scoreboard">
-          {gs?.playerOrder.map((pid, i) => (
-            <div key={pid} className={`score-card ${pid === curPid ? 'active-player' : ''}`}
-              style={{ borderColor: gs.players[pid].color }}>
-              <span style={{ color: gs.players[pid].color, fontWeight: 700 }}>P{i + 1}</span>
-              <span>{gs.players[pid].score}VP</span>
-              {pid === userId && <span style={{ fontSize: '0.7rem' }}>⭐</span>}
-            </div>
-          ))}
+          {gs?.playerOrder.map((pid, i) => {
+            const hasRoad = gs.longestRoadHolder === pid;
+            const hasArmy = gs.largestArmyHolder === pid;
+            return (
+              <div key={pid} style={{ position: 'relative' }}>
+                <div className={`score-card ${pid === curPid ? 'active-player' : ''}`}
+                  style={{ borderColor: gs.players[pid].color }}>
+                  <span style={{ color: gs.players[pid].color, fontWeight: 700, fontSize: '0.9rem' }}>{gs.players[pid].username || `P${i + 1}`}</span>
+                  <span>{gs.players[pid].score}VP</span>
+                  {pid === userId && <span style={{ fontSize: '0.7rem' }}>⭐</span>}
+                  <div style={{ display: 'flex', gap: '4px', marginLeft: '6px' }}>
+                    {hasRoad && (
+                      <motion.span initial={{ scale: 0 }} animate={{ scale: 1 }} title="Longest Road" 
+                        style={{ fontSize: '1.2rem', filter: 'drop-shadow(0 0 5px gold)' }}>🛤️</motion.span>
+                    )}
+                    {hasArmy && (
+                      <motion.span initial={{ scale: 0 }} animate={{ scale: 1 }} title="Largest Army" 
+                        style={{ fontSize: '1.2rem', filter: 'drop-shadow(0 0 5px gold)' }}>⚔️</motion.span>
+                    )}
+                  </div>
+                </div>
+
+                {/* Universal Physical Card Animations */}
+                <div style={{ position: 'absolute', top: '140%', left: '50%', transform: 'translateX(-50%)', zIndex: 9000, display: 'flex', pointerEvents: 'none' }}>
+                  <AnimatePresence>
+                    {globalFlies.filter(f => f.pid === pid).flatMap((fly, fIdx, arr) => {
+                      return Array.from({ length: fly.amount }).map((_, cIdx) => {
+                        const uniqueId = `${fly.id}-${cIdx}`;
+                        // We map all cards for this user to create a coherent fanned hand
+                        const totalCardsForUser = arr.reduce((sum, f) => sum + f.amount, 0);
+                        let offsetIndex = 0;
+                        for (let j = 0; j < fIdx; j++) offsetIndex += arr[j].amount;
+                        offsetIndex += cIdx;
+                        
+                        const angle = (offsetIndex - (totalCardsForUser - 1) / 2) * 12;
+                        const isFirstCard = offsetIndex === 0;
+                        
+                        return (
+                          <motion.div key={uniqueId} className={`deal-card ${fly.res}`}
+                            initial={fly.isGain 
+                              ? { opacity: 0, y: -40, scale: 0.3, rotate: angle - 30 } 
+                              : { opacity: 1, y: 0, scale: 1, rotate: angle }}
+                            animate={fly.isGain 
+                              ? { opacity: 1, y: 0, scale: 1, rotate: angle } 
+                              : { opacity: 0, y: 60, scale: 0.5, rotate: angle + 30, filter: 'grayscale(100%)' }}
+                            exit={{ opacity: 0, scale: 0.2 }}
+                            transition={{ type: 'spring', bounce: 0.4 }}
+                            style={{ 
+                              position: isFirstCard ? 'relative' : 'absolute', 
+                              left: isFirstCard ? 0 : `${offsetIndex * 15}px`, /* Fanning horizontal spread */
+                              boxShadow: fly.isGain ? '0 10px 20px rgba(0,0,0,0.8)' : 'none'
+                             }}
+                          >
+                            {RES[fly.res as ResourceType]}
+                            {!fly.isGain && (
+                              <div style={{ position: 'absolute', inset: 0, background: 'rgba(255,0,0,0.5)', borderRadius: '6px' }} />
+                            )}
+                          </motion.div>
+                        );
+                      });
+                    })}
+                  </AnimatePresence>
+                </div>
+              </div>
+            );
+          })}
         </div>
         <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+          <button className="btn-fullscreen" onClick={() => toggleFullscreen()}
+            title="Toggle fullscreen (F)">⛶ {isFullscreen ? 'Exit' : 'Full'}</button>
           <div style={{ width: 8, height: 8, borderRadius: '50%', background: isConnected ? 'var(--success)' : 'var(--danger)' }} />
           <span style={{ fontSize: '0.75rem', color: 'var(--text-dim)' }}>{isConnected ? 'Live' : '...'}</span>
         </div>
       </div>
+
+      {/* FULLSCREEN EXIT HINT */}
+      {isFullscreen && (
+        <div className="fullscreen-exit-hint" onClick={() => setIsFullscreen(false)}>
+          Press <b>Esc</b> or <b>F</b> to exit fullscreen
+        </div>
+      )}
 
       {/* BOARD */}
       <div className="game-board-area">
@@ -534,7 +818,8 @@ function App() {
             gameState={gs} onVertexClick={handleVertexClick}
             onEdgeClick={handleEdgeClick} onHexClick={handleHexClick}
             robberHex={gs?.robberHex ?? null} buildMode={buildMode}
-            setupHighlight={isMySetupTurn ? expectedAction ?? null : null} />
+            setupHighlight={isMySetupTurn ? expectedAction ?? null : null}
+            currentPlayerColor={gs?.players[userId]?.color} />
         ) : <div style={{ color: 'var(--text-dim)' }}>Loading board...</div>}
 
         {gs && gs.log && gs.log.length > 0 && (
@@ -575,13 +860,17 @@ function App() {
           </div>
         )}
 
-        {/* Resources */}
+        {/* Resources — Card Style */}
         {me && (
           <div className="sidebar-section">
             <h3>Resources</h3>
-            <div className="resource-grid">
-              {(Object.keys(me.resources) as ResourceType[]).map(r => (
-                <div key={r} className="resource-item"><span>{RES[r]}</span><span className="count">{me.resources[r]}</span></div>
+            <div className="resource-cards-row">
+              {(['wood','brick','sheep','wheat','ore'] as ResourceType[]).map(r => (
+                <div key={r} className={`resource-card ${r}`}>
+                  <span className="rc-icon">{RES[r]}</span>
+                  <span className="rc-count">{me.resources[r]}</span>
+                  <span className="rc-name">{r}</span>
+                </div>
               ))}
             </div>
           </div>
@@ -610,11 +899,16 @@ function App() {
         {mustDiscard && me && (
           <div className="discard-panel">
             <h4>🏴‍☠️ Discard {Math.floor(Object.values(me.resources).reduce((a, b) => a + b, 0) / 2)} cards</h4>
-            <div className="trade-inputs" style={{ marginBottom: '8px' }}>
-              {(Object.keys(me.resources) as ResourceType[]).map(r => (
-                <div key={r} className="trade-input-item"><span>{RES[r]}</span>
-                <input type="number" min={0} max={me.resources[r]} value={discardAmounts[r]}
-                  onChange={e => setDiscardAmounts({ ...discardAmounts, [r]: parseInt(e.target.value) || 0 })} /></div>
+            <div className="stepper-row" style={{ marginBottom: '8px' }}>
+              {(['wood','brick','sheep','wheat','ore'] as ResourceType[]).map(r => (
+                <div key={r} className="stepper-item">
+                  <span className="stepper-icon">{RES[r]}</span>
+                  <span className="stepper-value">{discardAmounts[r]}</span>
+                  <div className="stepper-controls">
+                    <button className="stepper-btn" onClick={() => setDiscardAmounts(d => ({ ...d, [r]: Math.max(0, d[r] - 1) }))}>−</button>
+                    <button className="stepper-btn" onClick={() => setDiscardAmounts(d => ({ ...d, [r]: Math.min(me.resources[r], d[r] + 1) }))}>+</button>
+                  </div>
+                </div>
               ))}
             </div>
             <button className="btn-action" style={{ width: '100%', background: 'var(--danger)', color: 'white' }}
@@ -664,39 +958,56 @@ function App() {
                   onClick={() => { setShowP2PTrade(!showP2PTrade); setShowBankTrade(false); }}>🤝 Player</button>
               </div>
               {showBankTrade && (
-                <div style={{ marginTop: '8px', display: 'flex', gap: '6px', alignItems: 'center' }}>
-                  <select value={bankOffer} onChange={e => setBankOffer(e.target.value as ResourceType)}
-                    style={{ flex: 1, background: '#1e293b', color: 'white', border: '1px solid rgba(255,255,255,0.15)', borderRadius: '6px', padding: '6px' }}>
-                    {(['wood','brick','sheep','wheat','ore'] as const).map(r => <option key={r} value={r}>{RES[r]} {r}</option>)}
-                  </select>
-                  <span>→</span>
-                  <select value={bankRequest} onChange={e => setBankRequest(e.target.value as ResourceType)}
-                    style={{ flex: 1, background: '#1e293b', color: 'white', border: '1px solid rgba(255,255,255,0.15)', borderRadius: '6px', padding: '6px' }}>
-                    {(['wood','brick','sheep','wheat','ore'] as const).map(r => <option key={r} value={r}>{RES[r]} {r}</option>)}
-                  </select>
-                  <button className="btn-action" style={{ padding: '6px 12px' }}
-                    onClick={() => { emit('bank_trade', { offer: bankOffer, request: bankRequest }); setShowBankTrade(false); }}>Go</button>
+                <div style={{ marginTop: '8px', background: 'rgba(0,0,0,0.3)', padding: '10px', borderRadius: '8px', border: '1px solid rgba(255,255,255,0.05)' }}>
+                  <div style={{ display: 'flex', gap: '6px', alignItems: 'center', marginBottom: '8px' }}>
+                    <select value={bankOffer} onChange={e => setBankOffer(e.target.value as ResourceType)}
+                      style={{ flex: 1, background: '#1e293b', color: 'white', border: '1px solid rgba(255,255,255,0.15)', borderRadius: '6px', padding: '6px' }}>
+                      {(['wood','brick','sheep','wheat','ore'] as const).map(r => <option key={r} value={r}>{RES[r]} {r}</option>)}
+                    </select>
+                    <span>→</span>
+                    <select value={bankRequest} onChange={e => setBankRequest(e.target.value as ResourceType)}
+                      style={{ flex: 1, background: '#1e293b', color: 'white', border: '1px solid rgba(255,255,255,0.15)', borderRadius: '6px', padding: '6px' }}>
+                      {(['wood','brick','sheep','wheat','ore'] as const).map(r => <option key={r} value={r}>{RES[r]} {r}</option>)}
+                    </select>
+                  </div>
+                  <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+                    <span style={{ fontSize: '0.8rem', color: 'var(--accent)', fontWeight: 600 }}>
+                      Rate: {getBestBankRate(bankOffer)}:1 {getBestBankRate(bankOffer) < 4 ? '✨' : ''}
+                    </span>
+                    <button className="btn-action" style={{ padding: '4px 16px' }}
+                      onClick={() => { emit('bank_trade', { offer: bankOffer, request: bankRequest }); setShowBankTrade(false); }}>Trade</button>
+                  </div>
                 </div>
               )}
               {showP2PTrade && (
                 <div style={{ marginTop: '8px' }}>
                   <div className="trade-section" style={{ marginBottom: '6px' }}>
                     <h4>You give</h4>
-                    <div className="trade-inputs">
+                    <div className="stepper-row">
                       {(['wood','brick','sheep','wheat','ore'] as const).map(r => (
-                        <div key={r} className="trade-input-item"><span>{RES[r]}</span>
-                        <input type="number" min={0} value={p2pOffer[r]}
-                          onChange={e => setP2pOffer({ ...p2pOffer, [r]: parseInt(e.target.value) || 0 })} /></div>
+                        <div key={r} className="stepper-item">
+                          <span className="stepper-icon">{RES[r]}</span>
+                          <span className="stepper-value">{p2pOffer[r]}</span>
+                          <div className="stepper-controls">
+                            <button className="stepper-btn" onClick={() => setP2pOffer(o => ({ ...o, [r]: Math.max(0, o[r] - 1) }))}>−</button>
+                            <button className="stepper-btn" onClick={() => setP2pOffer(o => ({ ...o, [r]: o[r] + 1 }))}>+</button>
+                          </div>
+                        </div>
                       ))}
                     </div>
                   </div>
                   <div className="trade-section">
                     <h4>You want</h4>
-                    <div className="trade-inputs">
+                    <div className="stepper-row">
                       {(['wood','brick','sheep','wheat','ore'] as const).map(r => (
-                        <div key={r} className="trade-input-item"><span>{RES[r]}</span>
-                        <input type="number" min={0} value={p2pRequest[r]}
-                          onChange={e => setP2pRequest({ ...p2pRequest, [r]: parseInt(e.target.value) || 0 })} /></div>
+                        <div key={r} className="stepper-item">
+                          <span className="stepper-icon">{RES[r]}</span>
+                          <span className="stepper-value">{p2pRequest[r]}</span>
+                          <div className="stepper-controls">
+                            <button className="stepper-btn" onClick={() => setP2pRequest(o => ({ ...o, [r]: Math.max(0, o[r] - 1) }))}>−</button>
+                            <button className="stepper-btn" onClick={() => setP2pRequest(o => ({ ...o, [r]: o[r] + 1 }))}>+</button>
+                          </div>
+                        </div>
                       ))}
                     </div>
                   </div>
@@ -723,38 +1034,121 @@ function App() {
               <div style={{ display: 'flex', flexDirection: 'column', gap: '4px' }}>
                 {me.devCards.map((card, i) => (
                   <div key={i} className="dev-card-item">
-                    <div><span className="card-name">{card.type}</span>
+                    <div style={{ flex: 1 }}><span className="card-name">{card.type}</span>
                       {card.boughtThisTurn && <span className="card-new"> (new)</span>}
                     </div>
-                    {card.type !== 'victoryPoint' && !card.boughtThisTurn && isMyTurn && (
+                    {card.type !== 'victoryPoint' && !card.boughtThisTurn && isMyTurn && !me.hasPlayedDevCardThisTurn && (
                       <button className="btn-action" style={{ padding: '2px 8px', fontSize: '0.7rem' }}
-                        onClick={() => emit('play_dev_card', { cardIndex: i })}>Play</button>
+                        onClick={() => {
+                          if (card.type === 'yearOfPlenty' || card.type === 'monopoly') {
+                            setDevCardAction(devCardAction?.index === i ? null : { index: i, type: card.type });
+                          } else {
+                            emit('play_dev_card', { cardIndex: i });
+                          }
+                        }}>Play</button>
                     )}
                   </div>
                 ))}
+
+                {/* Modals for Year of Plenty / Monopoly */}
+                {devCardAction && (
+                  <div className="glass-panel" style={{ padding: '10px', marginTop: '4px', fontSize: '0.8rem', background: 'rgba(0,0,0,0.5)' }}>
+                    {devCardAction.type === 'monopoly' ? (
+                      <>
+                        <h4 style={{ margin: '0 0 6px 0' }}>Monopoly: Choose Resource</h4>
+                        <select value={devRes1} onChange={e => setDevRes1(e.target.value as ResourceType)} style={{ width: '100%', marginBottom: '8px', padding: '4px' }}>
+                          {(['wood','brick','sheep','wheat','ore'] as const).map(r => <option key={r} value={r}>{RES[r]} {r}</option>)}
+                        </select>
+                        <button className="btn-action" style={{ width: '100%' }} onClick={() => {
+                          emit('play_dev_card', { cardIndex: devCardAction.index, payload: { resource: devRes1 } });
+                          setDevCardAction(null);
+                        }}>Steal All</button>
+                      </>
+                    ) : (
+                      <>
+                        <h4 style={{ margin: '0 0 6px 0' }}>Year of Plenty: Choose 2</h4>
+                        <div style={{ display: 'flex', gap: '4px', marginBottom: '8px' }}>
+                          <select value={devRes1} onChange={e => setDevRes1(e.target.value as ResourceType)} style={{ flex: 1, padding: '4px' }}>
+                            {(['wood','brick','sheep','wheat','ore'] as const).map(r => <option key={r} value={r}>{RES[r]} {r}</option>)}
+                          </select>
+                          <select value={devRes2} onChange={e => setDevRes2(e.target.value as ResourceType)} style={{ flex: 1, padding: '4px' }}>
+                            {(['wood','brick','sheep','wheat','ore'] as const).map(r => <option key={r} value={r}>{RES[r]} {r}</option>)}
+                          </select>
+                        </div>
+                        <button className="btn-action" style={{ width: '100%' }} onClick={() => {
+                          emit('play_dev_card', { cardIndex: devCardAction.index, payload: { res1: devRes1, res2: devRes2 } });
+                          setDevCardAction(null);
+                        }}>Take Resources</button>
+                      </>
+                    )}
+                  </div>
+                )}
               </div>
             )}
           </div>
         )}
 
-        {/* Incoming Trade */}
-        {gs?.activeTradeOffer && gs.activeTradeOffer.fromPlayer !== userId && (
-          <div className="incoming-trade">
-            <h4 style={{ margin: '0 0 6px 0' }}>🤝 Trade from P{pIdx(gs.activeTradeOffer.fromPlayer)}</h4>
-            <p style={{ fontSize: '0.8rem', margin: '2px 0' }}>
-              Gives: {Object.entries(gs.activeTradeOffer.offering).filter(([, v]) => v && v > 0).map(([r, v]) => `${RES[r]}×${v}`).join(' ')}
-            </p>
-            <p style={{ fontSize: '0.8rem', margin: '2px 0 8px' }}>
-              Wants: {Object.entries(gs.activeTradeOffer.requesting).filter(([, v]) => v && v > 0).map(([r, v]) => `${RES[r]}×${v}`).join(' ')}
-            </p>
-            <div style={{ display: 'flex', gap: '6px' }}>
-              <button className="btn-action" style={{ flex: 1, background: 'var(--success)' }}
-                onClick={() => emit('accept_trade')}>✅ Accept</button>
-              <button className="btn-action" style={{ flex: 1, background: 'var(--danger)', color: 'white' }}
-                onClick={() => emit('reject_trade')}>❌ Reject</button>
+        {/* Universal Trade Overlay (Prominent) */}
+        <AnimatePresence>
+          {gs?.activeTradeOffer && (
+            <div className="trade-fullscreen-overlay">
+              <motion.div className="glass-panel trade-modal" 
+                initial={{ scale: 0.8, opacity: 0, y: 50 }} animate={{ scale: 1, opacity: 1, y: 0 }} exit={{ scale: 0.8, opacity: 0, y: 50 }}>
+                <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', gap: '15px', marginBottom: '1.5rem' }}>
+                  <div className="trade-p-pill" style={{ borderColor: gs.players[gs.activeTradeOffer.fromPlayer]?.color }}>
+                    {gs.players[gs.activeTradeOffer.fromPlayer]?.username}
+                  </div>
+                  <span style={{ fontSize: '1.5rem' }}>🤝</span>
+                  <div className="trade-p-pill" style={{ opacity: 0.6 }}>Anyone</div>
+                </div>
+
+                <div className="trade-flow">
+                  <div className="trade-block">
+                    <div className="trade-label">Gives</div>
+                    <div className="trade-cards">
+                      {Object.entries(gs.activeTradeOffer.offering).flatMap(([res, amt]) => 
+                        Array.from({ length: amt || 0 }).map((_, i) => (
+                          <div key={`${res}-${i}`} className={`deal-card ${res}`} style={{ margin: '0 -10px' }}>
+                            {RES[res]}
+                          </div>
+                        ))
+                      )}
+                    </div>
+                  </div>
+
+                  <div className="trade-arrow">➡️</div>
+
+                  <div className="trade-block">
+                    <div className="trade-label">Wants</div>
+                    <div className="trade-cards">
+                      {Object.entries(gs.activeTradeOffer.requesting).flatMap(([res, amt]) => 
+                        Array.from({ length: amt || 0 }).map((_, i) => (
+                          <div key={`${res}-${i}`} className={`deal-card ${res}`} style={{ margin: '0 -10px' }}>
+                            {RES[res]}
+                          </div>
+                        ))
+                      )}
+                    </div>
+                  </div>
+                </div>
+
+                <div className="trade-actions" style={{ marginTop: '2rem', display: 'flex', gap: '12px' }}>
+                  {gs.activeTradeOffer.fromPlayer !== userId ? (
+                    <>
+                      <button className="btn-action btn-lg" style={{ flex: 2, background: 'var(--success)' }}
+                        onClick={() => emit('accept_trade')}>✅ Accept Trade</button>
+                      <button className="btn-action btn-ghost" style={{ flex: 1 }}
+                        onClick={() => emit('reject_trade')}>Dismiss</button>
+                    </>
+                  ) : (
+                    <button className="btn-action btn-ghost" style={{ width: '100%', border: '1px dashed var(--danger)', color: 'var(--danger)' }}
+                      onClick={() => emit('reject_trade')}>❌ Cancel My Offer</button>
+                  )}
+                </div>
+              </motion.div>
             </div>
-          </div>
-        )}
+          )}
+        </AnimatePresence>
 
         {/* VP */}
         {me && (

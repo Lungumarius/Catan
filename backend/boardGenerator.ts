@@ -1,4 +1,4 @@
-const HEX_COUNTS = {
+const HEX_COUNTS: Record<string, number> = {
   desert: 1,
   forest: 4,
   pasture: 4,
@@ -8,6 +8,17 @@ const HEX_COUNTS = {
 };
 
 const NUMBER_TOKENS = [2, 3, 3, 4, 4, 5, 5, 6, 6, 8, 8, 9, 9, 10, 10, 11, 11, 12];
+
+// Official Catan spiral order (clockwise from top-left edge, spiraling inward)
+const SPIRAL_COORDS: [number, number][] = [
+  [0, -2], [1, -2], [2, -2],
+  [2, -1], [2, 0],
+  [1, 1], [0, 2], [-1, 2],
+  [-2, 2], [-2, 1], [-2, 0],
+  [-1, -1], [0, -1], [1, -1],
+  [1, 0], [0, 1], [-1, 1],
+  [-1, 0], [0, 0]
+];
 
 export interface HexagonState {
   q: number;
@@ -41,52 +52,215 @@ const getVerticesForHex = (cx: number, cy: number): string[] => {
   return verts;
 };
 
-export function generateBoard(): { hexes: HexagonState[], ports: Port[] } {
-  const hexes: HexagonState[] = [];
-  const terrainPool: string[] = [];
+// ═══════════════════════════════════════════════════════════
+//  HEX ADJACENCY (for balancing constraints)
+// ═══════════════════════════════════════════════════════════
 
-  for (const [type, count] of Object.entries(HEX_COUNTS)) {
-    for (let i = 0; i < count; i++) {
-        terrainPool.push(type);
+const HEX_DIRECTIONS: [number, number][] = [
+  [1, 0], [1, -1], [0, -1],
+  [-1, 0], [-1, 1], [0, 1]
+];
+
+function getHexNeighborCoords(q: number, r: number): string[] {
+  return HEX_DIRECTIONS.map(([dq, dr]) => `${q + dq},${r + dr}`);
+}
+
+// ═══════════════════════════════════════════════════════════
+//  BALANCED BOARD GENERATION
+// ═══════════════════════════════════════════════════════════
+
+function shuffle<T>(arr: T[]): T[] {
+  const a = [...arr];
+  for (let i = a.length - 1; i > 0; i--) {
+    const j = Math.floor(Math.random() * (i + 1));
+    [a[i], a[j]] = [a[j], a[i]];
+  }
+  return a;
+}
+
+function isHighProbNumber(n: number | null): boolean {
+  return n === 6 || n === 8;
+}
+
+/**
+ * Check if placing the given number at hexIndex violates the "no 6-8 adjacent" rule.
+ */
+function violates68Rule(hexes: HexagonState[], hexIndex: number, numberVal: number): boolean {
+  if (!isHighProbNumber(numberVal)) return false;
+
+  const hex = hexes[hexIndex];
+  const neighborCoords = getHexNeighborCoords(hex.q, hex.r);
+
+  for (const nc of neighborCoords) {
+    const neighbor = hexes.find(h => `${h.q},${h.r}` === nc);
+    if (neighbor && isHighProbNumber(neighbor.number)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+/**
+ * Check if placing the given terrain type at hexIndex creates 3+ adjacent same-type cluster.
+ */
+function violatesResourceCluster(hexes: HexagonState[], hexIndex: number, terrainType: string): boolean {
+  if (terrainType === 'desert') return false;
+
+  const hex = hexes[hexIndex];
+  const neighborCoords = getHexNeighborCoords(hex.q, hex.r);
+
+  // Count same-type neighbors
+  let sameTypeNeighbors = 0;
+  for (const nc of neighborCoords) {
+    const neighbor = hexes.find(h => `${h.q},${h.r}` === nc);
+    if (neighbor && neighbor.type === terrainType) {
+      sameTypeNeighbors++;
     }
   }
 
-  // Shuffle terrain
-  terrainPool.sort(() => Math.random() - 0.5);
+  // Allow max 1 same-type neighbor (so max 2 touching = ok, 3+ = bad)
+  return sameTypeNeighbors >= 2;
+}
 
-  // Shuffle number tokens
-  const numberPool = [...NUMBER_TOKENS];
-  numberPool.sort(() => Math.random() - 0.5);
+/**
+ * Generate a balanced terrain layout with max attempts.
+ */
+function generateBalancedTerrain(coords: [number, number][]): HexagonState[] {
+  const MAX_ATTEMPTS = 200;
 
+  for (let attempt = 0; attempt < MAX_ATTEMPTS; attempt++) {
+    const terrainPool: string[] = [];
+    for (const [type, count] of Object.entries(HEX_COUNTS)) {
+      for (let i = 0; i < count; i++) terrainPool.push(type);
+    }
+    const shuffled = shuffle(terrainPool);
+
+    const hexes: HexagonState[] = coords.map(([q, r], i) => ({
+      q, r, type: shuffled[i], number: null,
+    }));
+
+    // Validate resource clustering
+    let valid = true;
+    for (let i = 0; i < hexes.length; i++) {
+      if (violatesResourceCluster(hexes, i, hexes[i].type)) {
+        valid = false;
+        break;
+      }
+    }
+    if (valid) return hexes;
+  }
+
+  // Fallback: return last attempt anyway
+  const terrainPool: string[] = [];
+  for (const [type, count] of Object.entries(HEX_COUNTS)) {
+    for (let i = 0; i < count; i++) terrainPool.push(type);
+  }
+  return coords.map(([q, r], i) => ({
+    q, r, type: shuffle(terrainPool)[i], number: null,
+  }));
+}
+
+/**
+ * Assign numbers using spiral order, enforcing the no-6-8-adjacent rule.
+ * Uses a swap-based approach: if placing a number would violate the rule,
+ * swap it with a future number that doesn't violate.
+ */
+function assignBalancedNumbers(hexes: HexagonState[]): void {
+  // Find the desert index
+  const desertIdx = hexes.findIndex(h => h.type === 'desert');
+
+  // Build spiral-ordered indices (excluding desert)
+  const spiralIndices: number[] = [];
+  for (const [sq, sr] of SPIRAL_COORDS) {
+    const idx = hexes.findIndex(h => h.q === sq && h.r === sr);
+    if (idx !== -1 && idx !== desertIdx) spiralIndices.push(idx);
+  }
+
+  // Shuffle the number tokens
+  let numbers = shuffle([...NUMBER_TOKENS]);
+
+  const MAX_RETRIES = 100;
+  for (let retry = 0; retry < MAX_RETRIES; retry++) {
+    // Try assigning in spiral order
+    let valid = true;
+
+    // Reset all numbers
+    hexes.forEach(h => h.number = null);
+
+    for (let i = 0; i < spiralIndices.length; i++) {
+      const hexIdx = spiralIndices[i];
+      const num = numbers[i];
+      hexes[hexIdx].number = num;
+
+      if (violates68Rule(hexes, hexIdx, num)) {
+        // Try to swap with a later number
+        let swapped = false;
+        for (let j = i + 1; j < numbers.length; j++) {
+          // Temporarily swap
+          [numbers[i], numbers[j]] = [numbers[j], numbers[i]];
+          hexes[hexIdx].number = numbers[i];
+          if (!violates68Rule(hexes, hexIdx, numbers[i])) {
+            swapped = true;
+            break;
+          }
+          // Swap back
+          [numbers[i], numbers[j]] = [numbers[j], numbers[i]];
+          hexes[hexIdx].number = num;
+        }
+        if (!swapped) {
+          valid = false;
+          break;
+        }
+      }
+    }
+
+    if (valid) return;
+    numbers = shuffle([...NUMBER_TOKENS]);
+  }
+
+  // Fallback: assign whatever we have
+  hexes.forEach(h => h.number = null);
+  let ni = 0;
+  for (const idx of spiralIndices) {
+    hexes[idx].number = numbers[ni++];
+  }
+}
+
+// ═══════════════════════════════════════════════════════════
+//  MAIN GENERATOR
+// ═══════════════════════════════════════════════════════════
+
+export function generateBoard(): { hexes: HexagonState[], ports: Port[] } {
+  // Generate hex coordinates
   const radius = 2;
-  let terrainIndex = 0;
-  let numberIndex = 0;
-
-  // Generate grid
+  const coords: [number, number][] = [];
   for (let q = -radius; q <= radius; q++) {
     const r1 = Math.max(-radius, -q - radius);
     const r2 = Math.min(radius, -q + radius);
     for (let r = r1; r <= r2; r++) {
-      const type = terrainPool[terrainIndex++];
-      const number = type === 'desert' ? null : numberPool[numberIndex++];
-      hexes.push({ q, r, type, number });
+      coords.push([q, r]);
     }
   }
+
+  // Step 1: Balanced terrain placement
+  const hexes = generateBalancedTerrain(coords);
+
+  // Step 2: Balanced number assignment (spiral + no-6-8-adjacent)
+  assignBalancedNumbers(hexes);
 
   // ─────────────────────────────────────────
   //  GENERATE PORTS (Fixed positions on edge)
   // ─────────────────────────────────────────
-  const portTypes: PortType[] = ['generic', 'wood', 'generic', 'brick', 'generic', 'sheep', 'generic', 'wheat', 'ore'];
   const portConfigs = [
-    { q: -2, r: 0, vIdx: [4, 5], type: 'generic' as PortType },
-    { q: -1, r: -1, vIdx: [5, 0], type: 'wood' as PortType },
-    { q: 1, r: -2, vIdx: [0, 1], type: 'generic' as PortType },
-    { q: 2, r: -2, vIdx: [1, 2], type: 'brick' as PortType },
-    { q: 2, r: -1, vIdx: [1, 2], type: 'generic' as PortType },
-    { q: 1, r: 1, vIdx: [2, 3], type: 'sheep' as PortType },
-    { q: 0, r: 2, vIdx: [2, 3], type: 'generic' as PortType },
-    { q: -2, r: 2, vIdx: [3, 4], type: 'wheat' as PortType },
-    { q: -2, r: 1, vIdx: [4, 5], type: 'ore' as PortType },
+    { q: 1, r: -2, vIdx: [4, 5], type: 'generic' as PortType }, // Top Middle (TR Edge)
+    { q: 2, r: -2, vIdx: [5, 0], type: 'sheep' as PortType },   // Top Right (Right Edge)
+    { q: 2, r: 0,  vIdx: [5, 0], type: 'generic' as PortType }, // Middle Right (Right Edge)
+    { q: 1, r: 1,  vIdx: [0, 1], type: 'brick' as PortType },   // Bottom Right (BR Edge)
+    { q: -1, r: 2, vIdx: [1, 2], type: 'generic' as PortType }, // Bottom Middle (BL Edge)
+    { q: -2, r: 2, vIdx: [2, 3], type: 'wheat' as PortType },   // Bottom Left (Left Edge)
+    { q: -2, r: 0, vIdx: [2, 3], type: 'generic' as PortType }, // Middle Left (Left Edge)
+    { q: -1, r: -1, vIdx: [3, 4], type: 'ore' as PortType },    // Top Left (TL Edge)
+    { q: 0, r: -2, vIdx: [3, 4], type: 'wood' as PortType },    // Top Middle Left (TL Edge)
   ];
 
   const ports: Port[] = portConfigs.map((config, i) => {
@@ -103,4 +277,3 @@ export function generateBoard(): { hexes: HexagonState[], ports: Port[] } {
 
   return { hexes, ports };
 }
-

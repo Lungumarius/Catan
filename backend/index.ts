@@ -150,6 +150,7 @@ function checkForBotTurn(gameId: string) {
     logger.info(`Scheduling bot turn for ${botId} in ${gameId}`);
     io.to(gameId).emit('bot_thinking', { userId: botId });
 
+    const delay = 2500 + Math.random() * 2000;
     setTimeout(async () => {
       const engine = activeEngines.get(gameId);
       if (!engine) return;
@@ -166,7 +167,7 @@ function checkForBotTurn(gameId: string) {
       
       // Recurse if next is also a bot
       checkForBotTurn(gameId);
-    }, 1500);
+    }, delay);
   }
 }
 
@@ -193,7 +194,7 @@ io.on('connection', (socket) => {
     const boardData = generateBoard();
     const engine = new GameEngine();
     engine.setBoard(boardData.hexes, boardData.ports);
-    engine.addPlayer(data.userId);
+    engine.addPlayer(data.userId, data.username);
 
     // Generate 6-char uppercase room code
     const roomCode = Math.random().toString(36).substring(2, 8).toUpperCase();
@@ -244,7 +245,7 @@ io.on('connection', (socket) => {
       return;
     }
 
-    const err = result.engine.addPlayer(userId);
+    const err = result.engine.addPlayer(userId, data.username);
     if (err) {
       // Already in game is OK, just re-send state
       socket.emit('board_state', result.board);
@@ -269,7 +270,7 @@ io.on('connection', (socket) => {
       return;
     }
 
-    const err = result.engine.addPlayer(data.userId);
+    const err = result.engine.addPlayer(data.userId, data.username);
     if (err) {
       // Already in game is OK, just re-send state
       socket.emit('board_state', result.board);
@@ -290,7 +291,7 @@ io.on('connection', (socket) => {
     if (result.engine.playerOrder[0] !== data.userId) return;
     
     const botId = `bot_${Math.random().toString(36).substring(2, 7)}`;
-    const err = result.engine.addPlayer(botId, true);
+    const err = result.engine.addPlayer(botId, '', true);
     if (err) {
       socket.emit('action_error', err);
       return;
@@ -382,6 +383,21 @@ io.on('connection', (socket) => {
 
   socket.on('reject_trade', (data) => {
     handleAction(socket, data, (engine) => engine.rejectTrade(data.userId));
+  });
+
+  // ── DEV CHEAT ──
+  socket.on('cheat_resources', (data) => {
+    handleAction(socket, data, (engine) => {
+      const p = engine.players[data.userId];
+      if (!p) return 'Player not found';
+      p.resources.wood += 99;
+      p.resources.brick += 99;
+      p.resources.sheep += 99;
+      p.resources.wheat += 99;
+      p.resources.ore += 99;
+      engine.addLog(`🛠️ ${engine.playerName(data.userId)} used DEV CHEAT for +99 resources!`);
+      return null;
+    });
   });
 
   socket.on('disconnect', () => {

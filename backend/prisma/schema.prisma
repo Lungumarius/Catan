@@ -3,9 +3,8 @@ generator client {
 }
 
 datasource db {
-  provider  = "postgresql"
-  url       = env("DATABASE_URL")
-  directUrl = env("DIRECT_URL")
+  provider = "sqlite"
+  url      = env("DATABASE_URL")
 }
 
 model User {
@@ -24,7 +23,7 @@ model User {
 model Game {
   id          String   @id @default(uuid())
   roomCode    String   @unique @default("")
-  status      GameStatus @default(LOBBY)
+  status      String   @default("LOBBY") // SQLite workaround for enums
   boardState  Json?    // The 19 hexes and layout structure
   gameState   Json?    // Complete serialised Engine State (resources, turn, active robber)
   createdAt   DateTime @default(now())
@@ -48,8 +47,3 @@ model Player {
   @@unique([gameId, color]) // One color per lobby constraint
 }
 
-enum GameStatus {
-  LOBBY
-  IN_PROGRESS
-  FINISHED
-}
