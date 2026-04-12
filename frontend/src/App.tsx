@@ -534,7 +534,7 @@ function App() {
           </div>
 
           <button className="btn-action btn-lg" style={{ width: '100%', marginBottom: '1rem' }}
-            onClick={() => socket?.emit('create_lobby', { userId })}>
+            onClick={() => socket?.emit('create_lobby', { userId, username: authUser.username })}>
             ➕ Create New Room
           </button>
 
@@ -546,7 +546,7 @@ function App() {
               maxLength={6}
             />
             <button className="btn-action" disabled={joinCode.length < 4}
-              onClick={() => { socket?.emit('join_by_code', { userId, roomCode: joinCode }); }}>
+              onClick={() => { socket?.emit('join_by_code', { userId, roomCode: joinCode, username: authUser.username }); }}>
               🔑 Join
             </button>
           </div>
@@ -561,7 +561,7 @@ function App() {
                 <span style={{ fontSize: '0.85rem' }}>🏰 {l.roomCode || l.id.substring(0, 8)}</span>
                 <button className="btn-action" onClick={() => {
                   setCurrentGameId(l.id); setView('LOBBY');
-                  socket?.emit('join_game', { gameId: l.id, userId });
+                  socket?.emit('join_game', { gameId: l.id, userId, username: authUser.username });
                 }}>Join</button>
               </div>
             ))}
