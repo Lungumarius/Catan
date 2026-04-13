@@ -97,6 +97,58 @@ async function saveCheckpoint(gameId: string) {
   });
 }
 
+async function handleGameOver(gameId: string, engine: GameEngine) {
+  const winnerId = engine.winner;
+  if (!winnerId || winnerId.startsWith('bot_')) {
+    // Winner is a bot — just mark finished
+    await prisma.game.update({ where: { id: gameId }, data: { status: 'FINISHED', gameState: engine.getState() as any } });
+    activeEngines.delete(gameId);
+    gameBoards.delete(gameId);
+    return;
+  }
+
+  // Determine real players (non-bot)
+  const realPlayerIds = engine.playerOrder.filter(pid => !engine.players[pid]?.isBot);
+  const totalReal = realPlayerIds.length;
+
+  // Calculate final VPs for all players
+  const getVP = (pid: string) => {
+    const p = engine.players[pid];
+    let vp = p.score;
+    if (engine.longestRoadHolder === pid) vp += 2;
+    if (engine.largestArmyHolder === pid) vp += 2;
+    vp += p.devCards.filter((c: any) => c.type === 'victoryPoint').length;
+    return vp;
+  };
+
+  // Sort real players by VP descending
+  const ranked = [...realPlayerIds].sort((a, b) => getVP(b) - getVP(a));
+
+  for (let i = 0; i < ranked.length; i++) {
+    const pid = ranked[i];
+    if (pid.startsWith('bot_')) continue;
+    try {
+      if (i === 0) {
+        // 1st place = win
+        await prisma.user.update({ where: { id: pid }, data: { wins: { increment: 1 }, elo: { increment: 25 } } });
+      } else if (i === 1 && totalReal === 2) {
+        // 2nd place with only 2 real players = 0.5 win (we store as no loss, small elo gain)
+        await prisma.user.update({ where: { id: pid }, data: { elo: { increment: 5 } } });
+      } else {
+        // 2nd+ in 3-4 player game = loss
+        await prisma.user.update({ where: { id: pid }, data: { losses: { increment: 1 }, elo: { decrement: 10 } } });
+      }
+    } catch (e) {
+      logger.error(`Failed to update stats for ${pid}`);
+    }
+  }
+
+  await prisma.game.update({ where: { id: gameId }, data: { status: 'FINISHED', gameState: engine.getState() as any } });
+  activeEngines.delete(gameId);
+  gameBoards.delete(gameId);
+  logger.info(`Game ${gameId} finished. Winner: ${winnerId}`);
+}
+
 // Helper: execute an engine action, handle errors, broadcast state
 async function handleAction(
   socket: any,
@@ -116,12 +168,19 @@ async function handleAction(
   }
 
   const engineState = result.engine.getState();
-  const gameRecord = await prisma.game.findUnique({ where: { id: gameId }, select: { status: true } });
+  await saveCheckpoint(gameId);
 
+  const gameRecord = await prisma.game.findUnique({ where: { id: gameId }, select: { status: true } });
   io.to(gameId).emit('game_state', { 
     ...engineState, 
     status: gameRecord?.status || 'LOBBY' 
   });
+
+  // Handle game over
+  if (engineState.phase === 'GAME_OVER' && engineState.winner) {
+    await handleGameOver(gameId, result.engine);
+    return;
+  }
 
   // Auto-trigger next bot if applicable
   checkForBotTurn(gameId);
@@ -268,20 +327,24 @@ io.on('connection', (socket) => {
     const { userId, gameId } = data;
     logger.info(`Rejoin attempt: User ${userId} for Game ${gameId}`);
 
+    const gameRecord = await prisma.game.findUnique({ where: { id: gameId } });
+    if (!gameRecord || gameRecord.status === 'FINISHED') {
+      socket.emit('action_error', 'Game session not found');
+      return;
+    }
+
     const result = await getOrInitGame(gameId);
     if (!result) {
       socket.emit('action_error', 'Game session not found');
       return;
     }
 
-    const gameRecord = await prisma.game.findUnique({ where: { id: gameId } });
-    if (!gameRecord) return;
-
+    const engineState = result.engine.getState();
     socket.join(gameId);
     socket.emit('board_state', result.board);
     socket.emit('game_joined', { gameId, roomCode: gameRecord.roomCode });
-    socket.emit('game_state', result.engine.getState());
-    logger.info(`Success: User ${userId} rejoined Game ${gameId}`);
+    socket.emit('game_state', { ...engineState, status: gameRecord.status });
+    logger.info(`Success: User ${userId} rejoined Game ${gameId} (status: ${gameRecord.status})`);
   });
 
   socket.on('join_game', async (data) => {
@@ -407,21 +470,6 @@ io.on('connection', (socket) => {
 
   socket.on('reject_trade', (data) => {
     handleAction(socket, data, (engine) => engine.rejectTrade(data.userId));
-  });
-
-  // ── DEV CHEAT ──
-  socket.on('cheat_resources', (data) => {
-    handleAction(socket, data, (engine) => {
-      const p = engine.players[data.userId];
-      if (!p) return 'Player not found';
-      p.resources.wood += 99;
-      p.resources.brick += 99;
-      p.resources.sheep += 99;
-      p.resources.wheat += 99;
-      p.resources.ore += 99;
-      engine.addLog(`🛠️ ${engine.playerName(data.userId)} used DEV CHEAT for +99 resources!`);
-      return null;
-    });
   });
 
   socket.on('disconnect', () => {

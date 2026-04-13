@@ -774,8 +774,8 @@ body {
 
 /* Number Tokens */
 .token {
-  width: 48px;
-  height: 48px;
+  width: 60px;
+  height: 60px;
   background: linear-gradient(145deg, #fef9e7, #f5e6b8);
   border-radius: 50%;
   display: flex;
@@ -791,16 +791,16 @@ body {
 }
 .token-number {
   font-weight: 900;
-  font-size: 1.2rem;
+  font-size: 1.8rem;
   color: #2c1810;
 }
 .token-dots {
-  font-size: 0.55rem;
+  font-size: 0.7rem;
   color: #8b6914;
   letter-spacing: -1px;
   margin-top: -2px;
 }
-.token.high-prob .token-number { color: #b91c1c; font-size: 1.4rem; }
+.token.high-prob .token-number { color: #b91c1c; font-size: 2rem; }
 .token.high-prob .token-dots { color: #b91c1c; }
 .token.high-prob { border-color: #b91c1c; }
 
@@ -849,7 +849,7 @@ body {
   align-items: center;
   gap: 6px;
   font-weight: 900;
-  color: #290f01; /* Very dark brown, almost black */
+  color: #000000;
   box-shadow: 0 4px 8px rgba(0,0,0,0.6);
   z-index: 3;
   transform: translateY(8px);
@@ -860,6 +860,8 @@ body {
 .port-badge-new .port-rate {
   font-size: 0.95rem;
   letter-spacing: 0.5px;
+  color: #000;
+  font-weight: 900;
 }
 
 .port-badge {
@@ -1006,14 +1008,19 @@ body {
 
 .robber-icon {
   position: absolute;
-  font-size: 2.2rem;
-  z-index: 15;
+  top: 50%;
+  left: 50%;
+  font-size: 2.4rem;
+  z-index: 20;
   filter: drop-shadow(0 3px 6px rgba(0,0,0,0.8));
+  pointer-events: none;
+  margin-left: 1.5rem;
+  margin-top: -3.5rem;
   animation: robber-bob 2.5s ease-in-out infinite;
 }
 @keyframes robber-bob {
   0%, 100% { transform: translateY(0); }
-  50% { transform: translateY(-4px); }
+  50% { transform: translateY(-5px); }
 }
 
 /* ─── ERROR TOAST ─── */

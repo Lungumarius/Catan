@@ -365,6 +365,12 @@ function App() {
         setView('GAME');
       }
       setIsRejoining(false);
+
+      // If finished game session, clear it from storage
+      if (st.status === 'FINISHED') {
+        localStorage.removeItem('catan_game_id');
+        localStorage.removeItem('catan_room_code');
+      }
     });
     s.on('bot_thinking', (d: { userId: string }) => {
       setBotThinking(d.userId);
@@ -696,7 +702,7 @@ function App() {
                       setStealTargets([]);
                     }}>
                     <div className="steal-dot" style={{ backgroundColor: player?.color }} />
-                    <span>Player {idx + 1}</span>
+                    <span>{player?.username || `Player ${idx + 1}`}</span>
                   </button>
                 );
               })}
@@ -736,22 +742,18 @@ function App() {
         ))}
       </AnimatePresence>
 
-      {/* DEV CHEAT BUTTON */}
-      {gs?.phase === 'MAIN_GAME' && (
-        <button 
-          onClick={() => socket?.emit('cheat_resources', { gameId: currentGameId, userId })}
-          style={{ position: 'absolute', bottom: 20, left: 20, zIndex: 9999, padding: '10px 15px', background: 'deeppink', color: 'white', fontWeight: 900, borderRadius: '8px', cursor: 'pointer', border: 'none', boxShadow: '0 4px 10px rgba(255, 20, 147, 0.5)' }}>
-          🛠️ DEV: +99 RES 
-        </button>
-      )}
-
       {/* VICTORY */}
       {gs?.winner && (
         <div className="victory-overlay">
           <motion.div className="glass-panel victory-card" initial={{ scale: 0 }} animate={{ scale: 1 }}>
             <h1>🏆 {gs.winner === userId ? 'YOU WIN!' : `${gs.players[gs.winner]?.username || 'Player'} Wins!`}</h1>
             <p style={{ fontSize: '1.2rem', marginBottom: '1rem' }}>{totalVP()} Victory Points</p>
-            <button className="btn-action btn-lg" onClick={() => setView('MATCHMAKING')}>Back to Lobby</button>
+            <button className="btn-action btn-lg" onClick={() => {
+              localStorage.removeItem('catan_game_id');
+              localStorage.removeItem('catan_room_code');
+              setGameState(null);
+              setView('MATCHMAKING');
+            }}>Back to Lobby</button>
           </motion.div>
         </div>
       )}
@@ -776,6 +778,11 @@ function App() {
                   <span style={{ color: gs.players[pid].color, fontWeight: 700, fontSize: '0.9rem' }}>{gs.players[pid].username || `P${i + 1}`}</span>
                   <span>{gs.players[pid].score}VP</span>
                   {pid === userId && <span style={{ fontSize: '0.7rem' }}>⭐</span>}
+                  <span style={{ fontSize: '0.7rem', color: 'var(--text-dim)', marginLeft: '4px' }}>
+                    {Object.values(gs.players[pid].resources).reduce((a: number, b: number) => a + b, 0)}🃏
+                    {' '}·{' '}
+                    {gs.players[pid].devCards?.length ?? 0}🎴
+                  </span>
                   <div style={{ display: 'flex', gap: '4px', marginLeft: '6px' }}>
                     {hasRoad && (
                       <motion.span initial={{ scale: 0 }} animate={{ scale: 1 }} title="Longest Road" 
@@ -1014,12 +1021,22 @@ function App() {
                       Rate: {getBestBankRate(bankOffer)}:1 {getBestBankRate(bankOffer) < 4 ? '✨' : ''}
                     </span>
                     <button className="btn-action" style={{ padding: '4px 16px' }}
-                      onClick={() => { emit('bank_trade', { offer: bankOffer, request: bankRequest }); setShowBankTrade(false); }}>Trade</button>
+                    onClick={() => { emit('bank_trade', { offer: bankOffer, request: bankRequest }); setShowBankTrade(false); setBankOffer('wood'); setBankRequest('ore'); }}>Trade</button>
                   </div>
                 </div>
               )}
               {showP2PTrade && (
                 <div style={{ marginTop: '8px' }}>
+                  {/* Show current hand during trade */}
+                  {me && (
+                    <div style={{ display: 'flex', gap: '4px', justifyContent: 'center', flexWrap: 'wrap', marginBottom: '8px', padding: '6px', background: 'rgba(0,0,0,0.3)', borderRadius: '8px' }}>
+                      {(['wood','brick','sheep','wheat','ore'] as ResourceType[]).map(r => (
+                        <span key={r} style={{ fontSize: '0.75rem', color: me.resources[r] > 0 ? 'var(--accent)' : 'var(--text-dim)' }}>
+                          {RES[r]}{me.resources[r]}
+                        </span>
+                      ))}
+                    </div>
+                  )}
                   <div className="trade-section" style={{ marginBottom: '6px' }}>
                     <h4>You give</h4>
                     <div className="stepper-row">
@@ -1051,7 +1068,7 @@ function App() {
                     </div>
                   </div>
                   <button className="btn-action" style={{ width: '100%', marginTop: '6px' }}
-                    onClick={() => { emit('propose_trade', { offering: p2pOffer, requesting: p2pRequest }); setShowP2PTrade(false); }}>
+                    onClick={() => { emit('propose_trade', { offering: p2pOffer, requesting: p2pRequest }); setShowP2PTrade(false); setP2pOffer(ZERO_RES()); setP2pRequest(ZERO_RES()); }}>
                     Propose Trade</button>
                 </div>
               )}

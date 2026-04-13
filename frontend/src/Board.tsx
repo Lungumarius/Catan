@@ -271,12 +271,12 @@ export function Board({ hexes, ports, gameState, onVertexClick, onEdgeClick, onH
                 transition={{ delay: idx * 0.03, duration: 0.5, ease: [0.34, 1.56, 0.64, 1] }}
                 onClick={() => isRobberMove && onHexClick(hc)}>
                 {hex.number && (
-                  <div className={`token ${hex.number === 6 || hex.number === 8 ? 'high-prob' : ''}`}>
+                  <div className={`token ${hex.number === 6 || hex.number === 8 ? 'high-prob' : ''}`} style={{ position: 'relative', zIndex: 10 }}>
                     <span className="token-number">{hex.number}</span>
                     <span className="token-dots">{'•'.repeat(dots)}</span>
                   </div>
                 )}
-                {hasRobber && <div className="robber-icon">🏴‍☠️</div>}
+                {hasRobber && <div className="robber-icon" style={{ zIndex: 20 }}>🏴‍☠️</div>}
               </motion.div>
             </div>
           );
