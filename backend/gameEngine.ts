@@ -1345,6 +1345,15 @@ export class GameEngine {
     const myRoadLength = this.calcLongestRoadForPlayer(botId);
     const scored: Array<{ eid: string; score: number }> = [];
 
+    // During setup, road MUST connect to the settlement just placed
+    let requiredVertex: string | null = null;
+    if (this.phase === 'SETUP_R1' || this.phase === 'SETUP_R2') {
+      const playerPlacements = this.setupSettlements.filter(s => s.playerId === botId);
+      if (playerPlacements.length > 0) {
+        requiredVertex = playerPlacements[playerPlacements.length - 1].vertexId;
+      }
+    }
+
     this.board.forEach(hex => {
       const { x, y } = getPixelPos(hex.q, hex.r);
       const verts = getVerticesForHex(x, y);
@@ -1352,11 +1361,16 @@ export class GameEngine {
         const v2 = arr[(i + 1) % 6];
         const eid = [v1, v2].sort().join(':');
         if (this.roads[eid]) return;
-        const connected =
-          (this.buildings[v1]?.owner === botId || this.buildings[v2]?.owner === botId) ||
-          Object.entries(this.roads).some(([rid, rOwner]) =>
-            rOwner === botId && (rid.split(':').includes(v1) || rid.split(':').includes(v2)));
-        if (!connected) return;
+
+        if (requiredVertex) {
+          if (v1 !== requiredVertex && v2 !== requiredVertex) return;
+        } else {
+          const connected =
+            (this.buildings[v1]?.owner === botId || this.buildings[v2]?.owner === botId) ||
+            Object.entries(this.roads).some(([rid, rOwner]) =>
+              rOwner === botId && (rid.split(':').includes(v1) || rid.split(':').includes(v2)));
+          if (!connected) return;
+        }
 
         let score = 1;
         // Simulate: temporarily add this road and check new road length
@@ -1369,6 +1383,9 @@ export class GameEngine {
         const bestV = this.getBestVertexForBot(botId);
         if (bestV && (v1 === bestV || v2 === bestV)) score += 3;
 
+        // Add some random noise so bot doesn't become predictable
+        score += Math.random();
+
         scored.push({ eid, score });
       });
     });
@@ -1377,6 +1394,7 @@ export class GameEngine {
     scored.sort((a, b) => b.score - a.score);
     return scored[0].eid;
   }
+
 
   private getBestRobberHexForBot(botId: string): string {
     let bestHex = this.robberHex;
