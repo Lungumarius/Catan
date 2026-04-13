@@ -210,15 +210,15 @@ function generateBoard() {
     //  GENERATE PORTS (Fixed positions on edge)
     // ─────────────────────────────────────────
     const portConfigs = [
-        { q: -2, r: 0, vIdx: [4, 5], type: 'generic' },
-        { q: -1, r: -1, vIdx: [5, 0], type: 'wood' },
-        { q: 1, r: -2, vIdx: [0, 1], type: 'generic' },
-        { q: 2, r: -2, vIdx: [1, 2], type: 'brick' },
-        { q: 2, r: -1, vIdx: [1, 2], type: 'generic' },
-        { q: 1, r: 1, vIdx: [2, 3], type: 'sheep' },
-        { q: 0, r: 2, vIdx: [2, 3], type: 'generic' },
-        { q: -2, r: 2, vIdx: [3, 4], type: 'wheat' },
-        { q: -2, r: 1, vIdx: [4, 5], type: 'ore' },
+        { q: 1, r: -2, vIdx: [4, 5], type: 'generic' }, // Top Middle (TR Edge)
+        { q: 2, r: -2, vIdx: [5, 0], type: 'sheep' }, // Top Right (Right Edge)
+        { q: 2, r: 0, vIdx: [5, 0], type: 'generic' }, // Middle Right (Right Edge)
+        { q: 1, r: 1, vIdx: [0, 1], type: 'brick' }, // Bottom Right (BR Edge)
+        { q: -1, r: 2, vIdx: [1, 2], type: 'generic' }, // Bottom Middle (BL Edge)
+        { q: -2, r: 2, vIdx: [2, 3], type: 'wheat' }, // Bottom Left (Left Edge)
+        { q: -2, r: 0, vIdx: [2, 3], type: 'generic' }, // Middle Left (Left Edge)
+        { q: -1, r: -1, vIdx: [3, 4], type: 'ore' }, // Top Left (TL Edge)
+        { q: 0, r: -2, vIdx: [3, 4], type: 'wood' }, // Top Middle Left (TL Edge)
     ];
     const ports = portConfigs.map((config, i) => {
         const { x, y } = getPixelPos(config.q, config.r);

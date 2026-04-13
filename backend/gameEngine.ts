@@ -51,6 +51,49 @@ export interface GameEvent {
   };
 }
 
+export interface GameAuditEntry {
+  id: string;
+  at: string;
+  type: string;
+  playerId: string | null;
+  turn: number;
+  phase: GamePhase;
+  details?: Record<string, unknown>;
+}
+
+export interface GameSnapshot {
+  snapshotVersion: number;
+  phase: GamePhase;
+  turnPhase: TurnPhase;
+  setupTurnIndex: number;
+  players: Record<string, Player>;
+  playerOrder: string[];
+  currentTurnIndex: number;
+  diceResult: number | null;
+  dice1: number;
+  dice2: number;
+  rollCount: number;
+  lastDiceYields: Record<string, ResourceType[]>;
+  buildings: Record<string, Building>;
+  roads: Record<string, string>;
+  robberHex: string;
+  playersWhoMustDiscard: string[];
+  devCardDeck: DevCardType[];
+  longestRoadHolder: string | null;
+  longestRoadLength: number;
+  largestArmyHolder: string | null;
+  largestArmySize: number;
+  activeTradeOffer: TradeOffer | null;
+  log: string[];
+  winner: string | null;
+  roadBuildingRemaining: number;
+  lastEvent: GameEvent | null;
+  setupSettlements: { playerId: string; vertexId: string }[];
+  startedAt: string | null;
+  finishedAt: string | null;
+  actionJournal: GameAuditEntry[];
+}
+
 export type BuildingType = 'settlement' | 'city';
 
 export interface Building {
@@ -89,6 +132,7 @@ const RESOURCE_FROM_HEX: Record<string, ResourceType | null> = {
 
 const HEX_WIDTH = 200;
 const SIZE = 115.47;
+const GAME_SNAPSHOT_VERSION = 2;
 
 const getPixelPos = (q: number, r: number) => ({
   x: HEX_WIDTH * (q + r / 2),
@@ -103,6 +147,8 @@ const getVerticesForHex = (cx: number, cy: number): string[] => {
   }
   return verts;
 };
+
+export { getPixelPos, getVerticesForHex, GAME_SNAPSHOT_VERSION };
 
 // ═══════════════════════════════════════════════════════════
 //  HELPER: Shuffle array in-place (Fisher-Yates)
@@ -176,6 +222,13 @@ export class GameEngine {
   // Road building dev card state
   roadBuildingRemaining: number = 0;
 
+  // Domain metadata
+  startedAt: string | null = null;
+  finishedAt: string | null = null;
+
+  // Server-side audit trail
+  actionJournal: GameAuditEntry[] = [];
+
   // Last game event (dev card play, steal) — emitted once then cleared
   lastEvent: GameEvent | null = null;
   private _lastEventId: number = 0;
@@ -223,8 +276,154 @@ export class GameEngine {
     this.devCardDeck = shuffle([...INITIAL_DEV_DECK]);
   }
 
+  private makeAuditId() {
+    return `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+  }
+
+  private recordAction(type: string, playerId: string | null, details?: Record<string, unknown>) {
+    this.actionJournal.push({
+      id: this.makeAuditId(),
+      at: new Date().toISOString(),
+      type,
+      playerId,
+      turn: this.currentTurnIndex,
+      phase: this.phase,
+      details,
+    });
+    if (this.actionJournal.length > 250) this.actionJournal.shift();
+  }
+
+  private isResourceBag(value: any): value is Resources {
+    return value
+      && typeof value === 'object'
+      && ['wood', 'brick', 'sheep', 'wheat', 'ore'].every((key) => typeof value[key] === 'number');
+  }
+
+  private normalizePlayer(raw: any, playerId: string, color: string): Player {
+    return {
+      id: typeof raw?.id === 'string' ? raw.id : playerId,
+      username: typeof raw?.username === 'string' ? raw.username : `Player ${this.playerOrder.length + 1}`,
+      color: typeof raw?.color === 'string' ? raw.color : color,
+      resources: this.isResourceBag(raw?.resources) ? raw.resources : { wood: 0, brick: 0, sheep: 0, wheat: 0, ore: 0 },
+      score: typeof raw?.score === 'number' ? raw.score : 0,
+      devCards: Array.isArray(raw?.devCards)
+        ? raw.devCards.filter((card: any) => typeof card?.type === 'string').map((card: any) => ({
+            type: card.type as DevCardType,
+            boughtThisTurn: Boolean(card.boughtThisTurn),
+          }))
+        : [],
+      knightsPlayed: typeof raw?.knightsPlayed === 'number' ? raw.knightsPlayed : 0,
+      hasPlayedDevCardThisTurn: Boolean(raw?.hasPlayedDevCardThisTurn),
+      isBot: Boolean(raw?.isBot),
+    };
+  }
+
+  private normalizeSnapshot(state: any): GameSnapshot {
+    const raw = state?.snapshotVersion ? state : {
+      snapshotVersion: 1,
+      ...state,
+      devCardDeck: Array.isArray(state?.devCardDeck) ? state.devCardDeck : [],
+      lastDiceYields: state?.lastDiceYields || {},
+      setupSettlements: Array.isArray(state?.setupSettlements) ? state.setupSettlements : [],
+      startedAt: state?.startedAt ?? null,
+      finishedAt: state?.finishedAt ?? null,
+      actionJournal: Array.isArray(state?.actionJournal) ? state.actionJournal : [],
+    };
+
+    if (!Array.isArray(raw.playerOrder)) {
+      throw new Error('Invalid game snapshot: missing player order');
+    }
+
+    const colors = ['#ef4444', '#3b82f6', '#22c55e', '#f97316'];
+    const playerOrder = raw.playerOrder.filter((playerId: any): playerId is string => typeof playerId === 'string');
+    const players = Object.fromEntries(
+      playerOrder.map((playerId: string, index: number) => [
+        playerId,
+        this.normalizePlayer(raw.players?.[playerId], playerId, colors[index % colors.length]),
+      ])
+    );
+
+    return {
+      snapshotVersion: GAME_SNAPSHOT_VERSION,
+      phase: raw.phase ?? 'SETUP_R1',
+      turnPhase: raw.turnPhase ?? 'FREE_ACTION',
+      setupTurnIndex: typeof raw.setupTurnIndex === 'number' ? raw.setupTurnIndex : 0,
+      players,
+      playerOrder,
+      currentTurnIndex: typeof raw.currentTurnIndex === 'number' ? raw.currentTurnIndex : 0,
+      diceResult: typeof raw.diceResult === 'number' ? raw.diceResult : null,
+      dice1: typeof raw.dice1 === 'number' ? raw.dice1 : 0,
+      dice2: typeof raw.dice2 === 'number' ? raw.dice2 : 0,
+      rollCount: typeof raw.rollCount === 'number' ? raw.rollCount : 0,
+      lastDiceYields: typeof raw.lastDiceYields === 'object' && raw.lastDiceYields ? raw.lastDiceYields : {},
+      buildings: typeof raw.buildings === 'object' && raw.buildings ? raw.buildings : {},
+      roads: typeof raw.roads === 'object' && raw.roads ? raw.roads : {},
+      robberHex: typeof raw.robberHex === 'string' ? raw.robberHex : this.robberHex,
+      playersWhoMustDiscard: Array.isArray(raw.playersWhoMustDiscard) ? raw.playersWhoMustDiscard.filter((playerId: any) => typeof playerId === 'string') : [],
+      devCardDeck: Array.isArray(raw.devCardDeck) ? raw.devCardDeck.filter((card: any) => typeof card === 'string') as DevCardType[] : [],
+      longestRoadHolder: typeof raw.longestRoadHolder === 'string' ? raw.longestRoadHolder : null,
+      longestRoadLength: typeof raw.longestRoadLength === 'number' ? raw.longestRoadLength : 0,
+      largestArmyHolder: typeof raw.largestArmyHolder === 'string' ? raw.largestArmyHolder : null,
+      largestArmySize: typeof raw.largestArmySize === 'number' ? raw.largestArmySize : 0,
+      activeTradeOffer: raw.activeTradeOffer && typeof raw.activeTradeOffer === 'object'
+        ? {
+            fromPlayer: raw.activeTradeOffer.fromPlayer,
+            offering: raw.activeTradeOffer.offering || {},
+            requesting: raw.activeTradeOffer.requesting || {},
+            rejectedBy: Array.isArray(raw.activeTradeOffer.rejectedBy) ? raw.activeTradeOffer.rejectedBy.filter((playerId: any) => typeof playerId === 'string') : [],
+          }
+        : null,
+      log: Array.isArray(raw.log) ? raw.log.filter((line: any) => typeof line === 'string').slice(-100) : [],
+      winner: typeof raw.winner === 'string' ? raw.winner : null,
+      roadBuildingRemaining: typeof raw.roadBuildingRemaining === 'number' ? raw.roadBuildingRemaining : 0,
+      lastEvent: raw.lastEvent && typeof raw.lastEvent === 'object' ? raw.lastEvent as GameEvent : null,
+      setupSettlements: Array.isArray(raw.setupSettlements)
+        ? raw.setupSettlements.filter((item: any) => typeof item?.playerId === 'string' && typeof item?.vertexId === 'string')
+        : [],
+      startedAt: typeof raw.startedAt === 'string' ? raw.startedAt : null,
+      finishedAt: typeof raw.finishedAt === 'string' ? raw.finishedAt : null,
+      actionJournal: Array.isArray(raw.actionJournal)
+        ? raw.actionJournal.filter((entry: any) => typeof entry?.id === 'string' && typeof entry?.type === 'string')
+        : [],
+    };
+  }
+
   setState(state: any) {
-    Object.assign(this, state);
+    const snapshot = this.normalizeSnapshot(state);
+    this.phase = snapshot.phase;
+    this.turnPhase = snapshot.turnPhase;
+    this.setupTurnIndex = snapshot.setupTurnIndex;
+    this.players = snapshot.players;
+    this.playerOrder = snapshot.playerOrder;
+    this.currentTurnIndex = snapshot.currentTurnIndex;
+    this.diceResult = snapshot.diceResult;
+    this.dice1 = snapshot.dice1;
+    this.dice2 = snapshot.dice2;
+    this.rollCount = snapshot.rollCount;
+    this.lastDiceYields = snapshot.lastDiceYields;
+    this.buildings = snapshot.buildings;
+    this.roads = snapshot.roads;
+    this.robberHex = snapshot.robberHex;
+    this.playersWhoMustDiscard = snapshot.playersWhoMustDiscard;
+    this.devCardDeck = snapshot.devCardDeck.length > 0 ? snapshot.devCardDeck : shuffle([...INITIAL_DEV_DECK]);
+    this.longestRoadHolder = snapshot.longestRoadHolder;
+    this.longestRoadLength = snapshot.longestRoadLength;
+    this.largestArmyHolder = snapshot.largestArmyHolder;
+    this.largestArmySize = snapshot.largestArmySize;
+    this.activeTradeOffer = snapshot.activeTradeOffer;
+    this.log = snapshot.log;
+    this.winner = snapshot.winner;
+    this.roadBuildingRemaining = snapshot.roadBuildingRemaining;
+    this.lastEvent = snapshot.lastEvent;
+    this.setupSettlements = snapshot.setupSettlements;
+    this.startedAt = snapshot.startedAt;
+    this.finishedAt = snapshot.finishedAt;
+    this.actionJournal = snapshot.actionJournal;
+  }
+
+  private isBlockedByOpponent(vertexId: string, userId: string) {
+    const building = this.buildings[vertexId];
+    return Boolean(building && building.owner !== userId);
   }
 
   addPlayer(userId: string, username: string = '', isBot: boolean = false): string | null {
@@ -253,6 +452,7 @@ export class GameEngine {
       isBot,
     };
     this.playerOrder.push(userId);
+    this.recordAction('player_joined', userId, { username: finalUsername, isBot });
     return null;
   }
 
@@ -309,6 +509,8 @@ export class GameEngine {
           this.phase = 'MAIN_GAME';
           this.turnPhase = 'MUST_ROLL';
           this.currentTurnIndex = 0;
+          this.startedAt = this.startedAt || new Date().toISOString();
+          this.recordAction('game_started', this.playerOrder[0] ?? null, { playerOrder: [...this.playerOrder] });
           this.addLog(`🎮 Main game begins! ${this.playerName(this.playerOrder[0])} rolls first.`);
         }
       }
@@ -369,6 +571,7 @@ export class GameEngine {
       this.buildings[vertexId] = { owner: userId, type: 'settlement' };
       this.setupSettlements.push({ playerId: userId, vertexId });
       p.score += 1;
+      this.recordAction('setup_settlement_placed', userId, { vertexId });
       this.addLog(`${this.playerName(userId)} placed a settlement (setup)`);
       // Don't advance setup yet — road must be placed next
       return null;
@@ -397,6 +600,7 @@ export class GameEngine {
 
     this.buildings[vertexId] = { owner: userId, type: 'settlement' };
     p.score += 1;
+    this.recordAction('settlement_built', userId, { vertexId });
     this.addLog(`${this.playerName(userId)} built a settlement`);
     this.recalcLongestRoad();
     this.checkVictory(userId);
@@ -419,7 +623,9 @@ export class GameEngine {
     const hasConnectingRoad = Object.entries(this.roads).some(([id, ownerId]) => {
       if (ownerId !== userId) return false;
       const [oA, oB] = id.split(':');
-      return oA === vA || oA === vB || oB === vA || oB === vB;
+      const touchesA = (oA === vA || oB === vA) && !this.isBlockedByOpponent(vA, userId);
+      const touchesB = (oA === vB || oB === vB) && !this.isBlockedByOpponent(vB, userId);
+      return touchesA || touchesB;
     });
     if (!hasConnectingBuilding && !hasConnectingRoad) return 'Must connect to your network';
 
@@ -436,6 +642,7 @@ export class GameEngine {
       }
 
       this.roads[edgeId] = userId;
+      this.recordAction('setup_road_placed', userId, { edgeId });
       this.addLog(`${this.playerName(userId)} placed starting road`);
       this.advanceSetup();
       return null;
@@ -449,6 +656,7 @@ export class GameEngine {
     if (this.roadBuildingRemaining > 0) {
       this.roads[edgeId] = userId;
       this.roadBuildingRemaining--;
+      this.recordAction('road_built_free', userId, { edgeId, remaining: this.roadBuildingRemaining });
       this.addLog(`${this.playerName(userId)} built a free road (Road Building)`);
       this.recalcLongestRoad();
       this.checkVictory(userId);
@@ -467,6 +675,7 @@ export class GameEngine {
     this.deductResources(p, cost);
 
     this.roads[edgeId] = userId;
+    this.recordAction('road_built', userId, { edgeId });
     this.addLog(`${this.playerName(userId)} built a road`);
     this.recalcLongestRoad();
     this.checkVictory(userId);
@@ -496,6 +705,7 @@ export class GameEngine {
 
     building.type = 'city';
     p.score += 1; // was 1VP as settlement, now 2VP as city → net +1
+    this.recordAction('city_upgraded', userId, { vertexId });
     this.addLog(`${this.playerName(userId)} upgraded to a city`);
     this.checkVictory(userId);
     return null;
@@ -513,6 +723,7 @@ export class GameEngine {
     this.dice1 = Math.floor(Math.random() * 6) + 1;
     this.dice2 = Math.floor(Math.random() * 6) + 1;
     this.diceResult = this.dice1 + this.dice2;
+    this.recordAction('dice_rolled', userId, { dice1: this.dice1, dice2: this.dice2, total: this.diceResult });
 
     this.addLog(`${this.playerName(userId)} rolled ${this.dice1} + ${this.dice2} = ${this.diceResult}`);
 
@@ -606,6 +817,7 @@ export class GameEngine {
     }
 
     this.playersWhoMustDiscard = this.playersWhoMustDiscard.filter(id => id !== userId);
+    this.recordAction('robber_discarded', userId, { discarded, discardTotal });
     this.addLog(`${this.playerName(userId)} discarded ${discardTotal} cards`);
 
     if (this.playersWhoMustDiscard.length === 0) {
@@ -626,6 +838,7 @@ export class GameEngine {
     if (!targetHex) return 'Invalid hex';
 
     this.robberHex = hexCoord;
+    this.recordAction('robber_moved', userId, { hexCoord, stealFromPlayer });
     this.addLog(`${this.playerName(userId)} moved the robber`);
 
     // Steal from adjacent player
@@ -643,6 +856,7 @@ export class GameEngine {
             this.players[userId].resources[stolenRes] += 1;
             const vp = this.players[userId];
             this.addLog(`${this.playerName(userId)} stole 1 card from ${this.playerName(stealFromPlayer)}`);
+            this.recordAction('resource_stolen', userId, { from: stealFromPlayer, resource: stolenRes, hexCoord });
             this.lastEvent = {
               type: 'steal', eventId: this._mkEventId(),
               playerId: userId, playerName: this.playerName(userId), playerColor: vp.color,
@@ -710,6 +924,7 @@ export class GameEngine {
     // Unmark "bought this turn" on previous player's cards
     this.players[userId].devCards.forEach(c => { c.boughtThisTurn = false; });
 
+    this.recordAction('turn_ended', userId, { nextPlayerId: this.playerOrder[this.currentTurnIndex] });
     this.addLog(`${this.playerName(userId)} ended their turn`);
     return null;
   }
@@ -733,6 +948,7 @@ export class GameEngine {
     const cardType = this.devCardDeck.pop()!;
     p.devCards.push({ type: cardType, boughtThisTurn: true });
 
+    this.recordAction('dev_card_bought', userId, { cardType });
     this.addLog(`${this.playerName(userId)} bought a development card`);
     if (cardType === 'victoryPoint') {
       this.checkVictory(userId);
@@ -762,6 +978,7 @@ export class GameEngine {
         this.turnPhase = 'ROBBER_MOVE';
         p.devCards.splice(cardIndex, 1);
         this.checkVictory(userId);
+        this.recordAction('dev_card_played', userId, { cardType: 'knight' });
         this.lastEvent = {
           type: 'dev_card', eventId: this._mkEventId(),
           playerId: userId, playerName: this.playerName(userId), playerColor: p.color,
@@ -776,6 +993,7 @@ export class GameEngine {
         p.resources[payload.res2 as ResourceType] += 1;
         this.addLog(`${this.playerName(userId)} played Year of Plenty (${payload.res1}, ${payload.res2})`);
         p.devCards.splice(cardIndex, 1);
+        this.recordAction('dev_card_played', userId, { cardType: 'yearOfPlenty', res1: payload.res1, res2: payload.res2 });
         this.lastEvent = {
           type: 'dev_card', eventId: this._mkEventId(),
           playerId: userId, playerName: this.playerName(userId), playerColor: p.color,
@@ -797,6 +1015,7 @@ export class GameEngine {
         p.resources[res] += stolen;
         this.addLog(`${this.playerName(userId)} played Monopoly on ${res} → stole ${stolen}`);
         p.devCards.splice(cardIndex, 1);
+        this.recordAction('dev_card_played', userId, { cardType: 'monopoly', resource: res, stolen });
         this.lastEvent = {
           type: 'dev_card', eventId: this._mkEventId(),
           playerId: userId, playerName: this.playerName(userId), playerColor: p.color,
@@ -809,6 +1028,7 @@ export class GameEngine {
         this.roadBuildingRemaining = 2;
         this.addLog(`${this.playerName(userId)} played Road Building`);
         p.devCards.splice(cardIndex, 1);
+        this.recordAction('dev_card_played', userId, { cardType: 'roadBuilding' });
         this.lastEvent = {
           type: 'dev_card', eventId: this._mkEventId(),
           playerId: userId, playerName: this.playerName(userId), playerColor: p.color,
@@ -852,6 +1072,7 @@ export class GameEngine {
 
     p.resources[offer] -= rate;
     p.resources[request] += 1;
+    this.recordAction('bank_trade', userId, { offer, request, rate });
     this.addLog(`${this.playerName(userId)} traded ${rate} ${offerRes} → 1 ${requestRes}`);
     return null;
   }
@@ -871,6 +1092,7 @@ export class GameEngine {
     }
 
     this.activeTradeOffer = { fromPlayer: userId, offering, requesting, rejectedBy: [] };
+    this.recordAction('trade_proposed', userId, { offering, requesting });
     this.addLog(`${this.playerName(userId)} proposed a trade`);
     return null;
   }
@@ -902,6 +1124,7 @@ export class GameEngine {
     }
 
     this.addLog(`${this.playerName(userId)} accepted trade from ${this.playerName(this.activeTradeOffer.fromPlayer)}`);
+    this.recordAction('trade_accepted', userId, { fromPlayer: this.activeTradeOffer.fromPlayer });
     this.activeTradeOffer = null;
     return null;
   }
@@ -910,6 +1133,7 @@ export class GameEngine {
     if (!this.activeTradeOffer) return null;
     // Proposer cancels their own offer
     if (userId === this.activeTradeOffer.fromPlayer) {
+      this.recordAction('trade_cancelled', userId, {});
       this.activeTradeOffer = null;
       return null;
     }
@@ -921,6 +1145,7 @@ export class GameEngine {
     const nonProposers = this.playerOrder.filter(pid => pid !== this.activeTradeOffer!.fromPlayer);
     if (nonProposers.every(pid => this.activeTradeOffer!.rejectedBy.includes(pid))) {
       this.addLog(`Trade offer expired — all dismissed`);
+      this.recordAction('trade_expired', userId, { fromPlayer: this.activeTradeOffer.fromPlayer });
       this.activeTradeOffer = null;
     }
     return null;
@@ -1104,6 +1329,8 @@ export class GameEngine {
     if (vp >= 10) {
       this.phase = 'GAME_OVER';
       this.winner = userId;
+       this.finishedAt = new Date().toISOString();
+      this.recordAction('game_finished', userId, { winnerId: userId, victoryPoints: vp });
       this.addLog(`🏆 ${this.playerName(userId)} WINS with ${vp} Victory Points!`);
     }
   }
@@ -1480,6 +1707,7 @@ export class GameEngine {
 
   getState() {
     return {
+      snapshotVersion: GAME_SNAPSHOT_VERSION,
       phase: this.phase,
       turnPhase: this.turnPhase,
       setupTurnIndex: this.setupTurnIndex,
@@ -1489,22 +1717,28 @@ export class GameEngine {
       diceResult: this.diceResult,
       dice1: this.dice1,
       dice2: this.dice2,
+      rollCount: this.rollCount,
+      lastDiceYields: this.lastDiceYields,
       buildings: this.buildings,
       roads: this.roads,
       robberHex: this.robberHex,
       playersWhoMustDiscard: this.playersWhoMustDiscard,
+      devCardDeck: this.devCardDeck,
       devCardDeckSize: this.devCardDeck.length,
       longestRoadHolder: this.longestRoadHolder,
       longestRoadLength: this.longestRoadLength,
       largestArmyHolder: this.largestArmyHolder,
       largestArmySize: this.largestArmySize,
       activeTradeOffer: this.activeTradeOffer,
-      log: this.log.slice(-20),
+      log: this.log.slice(-100),
       winner: this.winner,
       setupInfo: this.getSetupInfo(),
       roadBuildingRemaining: this.roadBuildingRemaining,
       lastEvent: this.lastEvent,
+      setupSettlements: this.setupSettlements,
+      startedAt: this.startedAt,
+      finishedAt: this.finishedAt,
+      actionJournal: this.actionJournal,
     };
   }
 }
-

@@ -137,8 +137,30 @@ function DiceAnimation({ d1, d2, total, onComplete }: { d1: number; d2: number; 
 // ═══════════════════════════════════════════════════════════
 
 type View = 'AUTH' | 'MATCHMAKING' | 'LOBBY' | 'GAME';
+type GameStatus = 'LOBBY' | 'IN_PROGRESS' | 'FINISHED';
+type PlayerPresenceState = Record<string, { connected: boolean; lastSeenAt: string | null }>;
 
 interface AuthUser { id: string; username: string; wins: number; losses: number; elo: number; }
+interface MatchHistoryEntry {
+  gameId: string;
+  roomCode: string;
+  finishedAt: string;
+  winner: { id: string; username: string; color: string | null } | null;
+  didWin: boolean;
+  finalVp: number;
+  standings: { id: string; username: string; color: string; vp: number }[];
+}
+
+interface MatchHistoryResponse {
+  items: MatchHistoryEntry[];
+  page: number;
+  pageSize: number;
+  hasMore: boolean;
+}
+
+function getViewForStatus(status?: string): View {
+  return status === 'IN_PROGRESS' || status === 'FINISHED' ? 'GAME' : 'LOBBY';
+}
 
 function App() {
   // Auth state
@@ -156,11 +178,15 @@ function App() {
   const [gameState, setGameState] = useState<GameState | null>(null);
   const [view, setView] = useState<View>('AUTH');
   const [lobbies, setLobbies] = useState<any[]>([]);
+  const [matchHistory, setMatchHistory] = useState<MatchHistoryEntry[]>([]);
+  const [matchHistoryPage, setMatchHistoryPage] = useState(1);
+  const [hasMoreMatchHistory, setHasMoreMatchHistory] = useState(false);
   const [currentGameId, setCurrentGameId] = useState<string | null>(null);
   const [gameStarted, setGameStarted] = useState(false);
   const [joinCode, setJoinCode] = useState('');
   const [roomCode, setRoomCode] = useState('');
   const [botThinking, setBotThinking] = useState<string | null>(null);
+  const [playerPresence, setPlayerPresence] = useState<PlayerPresenceState>({});
   const [isFullscreen, setIsFullscreen] = useState(false);
   const [isRejoining, setIsRejoining] = useState(!!localStorage.getItem('catan_game_id'));
   void gameStarted; // Used by game_started socket event
@@ -196,7 +222,10 @@ function App() {
   // Universal Physical Card Animations
   const [globalFlies, setGlobalFlies] = useState<{ id: number; pid: string; res: string; amount: number; isGain: boolean }[]>([]);
   const prevPlayersRef = useRef<Record<string, PlayerState> | null>(null);
+  const latestDiceResultRef = useRef<number | null>(null);
   const flyIdRef = useRef(0);
+  const rejoinTimeoutRef = useRef<number | null>(null);
+  const currentGameIdRef = useRef<string | null>(null);
 
   // Dev Card / Steal event overlay
   const [devCardEvent, setDevCardEvent] = useState<GameEvent | null>(null);
@@ -261,9 +290,69 @@ function App() {
 
   const userId = authUser?.id ?? '';
 
+  const clearStoredSession = useCallback(() => {
+    localStorage.removeItem('catan_game_id');
+    localStorage.removeItem('catan_room_code');
+    localStorage.removeItem('catan_session_token');
+  }, []);
+
+  const refreshProfile = useCallback(async () => {
+    const token = localStorage.getItem('catan_token');
+    if (!token) return;
+
+    try {
+      const res = await fetch(`${API}/api/me`, { headers: { Authorization: `Bearer ${token}` } });
+      const data = await res.json();
+      if (data?.id) setAuthUser(data);
+    } catch {
+      // Keep existing profile snapshot if refresh fails.
+    }
+  }, []);
+
+  const refreshMatchHistory = useCallback(async (page = 1, append = false) => {
+    const token = localStorage.getItem('catan_token');
+    if (!token) return;
+
+    try {
+      const res = await fetch(`${API}/api/matches?page=${page}&pageSize=8`, { headers: { Authorization: `Bearer ${token}` } });
+      if (!res.ok) return;
+      const data = await res.json() as MatchHistoryResponse;
+      if (Array.isArray(data.items)) {
+        setMatchHistory((current) => append ? [...current, ...data.items] : data.items);
+        setMatchHistoryPage(data.page);
+        setHasMoreMatchHistory(data.hasMore);
+      }
+    } catch {
+      // Keep last loaded history snapshot if refresh fails.
+    }
+  }, []);
+
+  const resetActiveSession = useCallback(() => {
+    clearStoredSession();
+    setCurrentGameId(null);
+    setRoomCode('');
+    setGameState(null);
+    setBoardState({ hexes: [], ports: [] });
+    setPlayerPresence({});
+    setBotThinking(null);
+    setBuildMode(null);
+    setShowBankTrade(false);
+    setShowP2PTrade(false);
+    setShowDevCards(false);
+    setPendingRobberHex(null);
+    setStealTargets([]);
+    setDevCardAction(null);
+    prevPlayersRef.current = null;
+    latestDiceResultRef.current = null;
+  }, [clearStoredSession]);
+
   const emit = useCallback((event: string, payload: any = {}) => {
     socket?.emit(event, { ...payload, gameId: currentGameId, userId, username: authUser?.username });
   }, [socket, currentGameId, userId, authUser]);
+
+  useEffect(() => {
+    currentGameIdRef.current = currentGameId;
+  }, [currentGameId]);
 
   // ── Check stored token on mount ──
   useEffect(() => {
@@ -272,14 +361,14 @@ function App() {
       fetch(`${API}/api/me`, { headers: { Authorization: `Bearer ${token}` } })
         .then(r => r.json())
         .then(data => {
-          if (data.id) { setAuthUser(data); setView('MATCHMAKING'); }
+          if (data.id) { setAuthUser(data); setView('MATCHMAKING'); refreshMatchHistory(1, false); }
           else { setIsRejoining(false); }
         })
         .catch(() => { setIsRejoining(false); });
     } else {
       setIsRejoining(false);
     }
-  }, []);
+  }, [refreshMatchHistory]);
 
   // ── Auth handler ──
   const handleAuth = async () => {
@@ -297,6 +386,7 @@ function App() {
         localStorage.setItem('catan_token', data.token);
         localStorage.setItem('catan_user', JSON.stringify(data.user));
         setAuthUser(data.user);
+        refreshMatchHistory(1, false);
         setView('MATCHMAKING');
       } else {
         setAuthError(data.error || 'Something went wrong');
@@ -310,31 +400,65 @@ function App() {
   // ── Socket setup (after auth) ──
   useEffect(() => {
     if (!authUser) return;
-    const s = io(API);
+    const s = io(API, {
+      reconnection: true,
+      reconnectionAttempts: Infinity,
+      reconnectionDelay: 1000,
+      reconnectionDelayMax: 5000,
+      timeout: 10000,
+    });
     setSocket(s);
+
+    const clearRejoinTimeout = () => {
+      if (rejoinTimeoutRef.current) {
+        window.clearTimeout(rejoinTimeoutRef.current);
+        rejoinTimeoutRef.current = null;
+      }
+    };
 
     s.on('connect', () => {
       setIsConnected(true);
-      // Attempt to rejoin if we have a saved gameId
+      clearRejoinTimeout();
       const savedGameId = localStorage.getItem('catan_game_id');
+      const savedSessionToken = localStorage.getItem('catan_session_token');
       if (savedGameId) {
         setIsRejoining(true);
-        s.emit('rejoin_game', { userId: authUser.id, gameId: savedGameId });
-        
-        // Safety timeout: if server doesn't respond in 6s, let user play normally
-        setTimeout(() => setIsRejoining(false), 6000);
+        s.emit('rejoin_game', { userId: authUser.id, gameId: savedGameId, sessionToken: savedSessionToken });
+        rejoinTimeoutRef.current = window.setTimeout(() => setIsRejoining(false), 6000);
+      } else {
+        s.emit('fetch_lobbies');
       }
     });
-    s.on('disconnect', () => setIsConnected(false));
-    s.on('game_joined', (data) => {
+    s.on('disconnect', () => {
+      setIsConnected(false);
+      if (localStorage.getItem('catan_game_id')) {
+        setIsRejoining(true);
+      }
+    });
+    s.on('game_joined', (data: { gameId: string; roomCode: string; status?: GameStatus; sessionToken?: string }) => {
+      clearRejoinTimeout();
       setIsRejoining(false);
       setCurrentGameId(data.gameId);
       setRoomCode(data.roomCode);
       localStorage.setItem('catan_game_id', data.gameId);
       localStorage.setItem('catan_room_code', data.roomCode);
-      setView('LOBBY');
+      if (data.sessionToken) localStorage.setItem('catan_session_token', data.sessionToken);
+      setView(getViewForStatus(data.status));
     });
     s.on('lobbies_update', (l: any[]) => setLobbies(l));
+    s.on('presence_update', (presence: PlayerPresenceState) => setPlayerPresence(presence));
+    s.on('game_event', (event: GameEvent) => {
+      if (event?.eventId && event.eventId !== lastShownEventId.current) {
+        lastShownEventId.current = event.eventId;
+        setDevCardEvent(event);
+      }
+    });
+    s.on('rematch_ready', (data: { gameId: string; roomCode: string; requestedBy: string }) => {
+      if (data.requestedBy === authUser.id) return;
+      setCurrentGameId(data.gameId);
+      setRoomCode(data.roomCode);
+      s.emit('join_game', { gameId: data.gameId, userId: authUser.id, username: authUser.username });
+    });
     s.on('board_state', (data: any) => {
       if (data.hexes) {
         setBoardState(data);
@@ -374,7 +498,7 @@ function App() {
         
         if (flies.length > 0) {
           // If a dice roll just happened, wait for the animation to finish (~2s)
-          const delay = (st.diceResult && (!prevP || !prevP[authUser.id]) && st.diceResult !== (gameState?.diceResult)) ? 2200 : 0;
+          const delay = (st.diceResult && (!prevP || !prevP[authUser.id]) && st.diceResult !== latestDiceResultRef.current) ? 2200 : 0;
           
           setTimeout(() => {
             setGlobalFlies(f => [...f, ...flies]);
@@ -387,11 +511,14 @@ function App() {
       
       // Save deep copy of all players for accurate deltas
       prevPlayersRef.current = JSON.parse(JSON.stringify(st.players));
+      latestDiceResultRef.current = st.diceResult;
 
-      // Persistence Fix: Only auto-switch to GAME view if the game has explicitly STARTED
-      if (st.status === 'STARTED' && view !== 'GAME') {
+      if (st.status === 'IN_PROGRESS' || st.status === 'FINISHED') {
         setView('GAME');
+      } else if (st.status === 'LOBBY' && localStorage.getItem('catan_game_id')) {
+        setView('LOBBY');
       }
+      clearRejoinTimeout();
       setIsRejoining(false);
 
       // Dev card / steal event overlay
@@ -403,29 +530,41 @@ function App() {
 
       // If finished game session, clear it from storage
       if (st.status === 'FINISHED') {
-        localStorage.removeItem('catan_game_id');
-        localStorage.removeItem('catan_room_code');
+        clearStoredSession();
+        refreshProfile();
+        refreshMatchHistory(1, false);
       }
     });
     s.on('bot_thinking', (d: { userId: string }) => {
       setBotThinking(d.userId);
     });
     s.on('game_started', () => {
+      clearRejoinTimeout();
       setIsRejoining(false);
       setGameStarted(true);
       setView('GAME');
     });
     s.on('action_error', (msg: string) => { 
+      clearRejoinTimeout();
       setIsRejoining(false);
       if (msg.toLowerCase().includes('not found')) {
-        localStorage.removeItem('catan_game_id');
-        localStorage.removeItem('catan_room_code');
+        resetActiveSession();
+        setView('MATCHMAKING');
       }
       setErrorMsg(msg); 
       setTimeout(() => setErrorMsg(null), 3000); 
     });
-    return () => { s.close(); };
-  }, [authUser]);
+    return () => {
+      clearRejoinTimeout();
+      s.close();
+    };
+  }, [authUser, clearStoredSession, refreshMatchHistory, refreshProfile, resetActiveSession]);
+
+  useEffect(() => {
+    if (socket && isConnected && view === 'MATCHMAKING') {
+      socket.emit('fetch_lobbies');
+    }
+  }, [socket, isConnected, view]);
 
   // ── Derived ──
   const gs = gameState;
@@ -508,8 +647,10 @@ function App() {
   const logout = () => {
     localStorage.removeItem('catan_token');
     localStorage.removeItem('catan_user');
-    localStorage.removeItem('catan_game_id');
-    localStorage.removeItem('catan_room_code');
+    resetActiveSession();
+    setMatchHistory([]);
+    setMatchHistoryPage(1);
+    setHasMoreMatchHistory(false);
     setAuthUser(null);
     setView('AUTH');
     socket?.close();
@@ -607,6 +748,40 @@ function App() {
               </div>
             ))}
           </div>
+
+          <h3 style={{ textAlign: 'left', borderBottom: '1px solid rgba(255,255,255,0.08)', paddingBottom: '6px', fontSize: '0.8rem', color: 'var(--text-dim)', textTransform: 'uppercase', letterSpacing: '1px', marginTop: '1.5rem' }}>
+            Recent Matches
+          </h3>
+          <div style={{ display: 'flex', flexDirection: 'column', gap: '8px', marginTop: '10px', maxHeight: '260px', overflowY: 'auto' }}>
+            {matchHistory.length === 0 && <p style={{ color: 'var(--text-dim)', fontSize: '0.85rem' }}>No finished matches yet.</p>}
+            {matchHistory.map(match => (
+              <div key={match.gameId} style={{ background: 'rgba(0,0,0,0.25)', padding: '10px 14px', borderRadius: '10px', border: '1px solid rgba(255,255,255,0.05)', textAlign: 'left' }}>
+                <div style={{ display: 'flex', justifyContent: 'space-between', gap: '12px', alignItems: 'center' }}>
+                  <span style={{ fontSize: '0.82rem', fontWeight: 700, color: match.didWin ? '#86efac' : '#fca5a5' }}>
+                    {match.didWin ? 'Win' : 'Loss'}
+                  </span>
+                  <span style={{ fontSize: '0.72rem', color: 'var(--text-dim)' }}>
+                    {new Date(match.finishedAt).toLocaleString()}
+                  </span>
+                </div>
+                <div style={{ marginTop: '4px', fontSize: '0.85rem' }}>
+                  Winner: <span style={{ fontWeight: 700, color: match.winner?.color || 'var(--accent)' }}>{match.winner?.username || 'Unknown'}</span>
+                </div>
+                <div style={{ marginTop: '2px', fontSize: '0.75rem', color: 'var(--text-dim)' }}>
+                  Room {match.roomCode} • You finished with {match.finalVp} VP
+                </div>
+              </div>
+            ))}
+          </div>
+          {hasMoreMatchHistory && (
+            <button
+              className="btn-action btn-ghost"
+              style={{ width: '100%', marginTop: '10px' }}
+              onClick={() => refreshMatchHistory(matchHistoryPage + 1, true)}
+            >
+              Load More Matches
+            </button>
+          )}
         </motion.div>
       </div>
     );
@@ -658,6 +833,7 @@ function App() {
                         </div>
                         <div style={{ fontSize: '0.7rem', color: 'var(--text-dim)' }}>
                           {gs?.players[pid]?.isBot ? 'Legendary Opponent' : 'Human Player'} {i === 0 ? '👑 Host' : ''}
+                          {!gs?.players[pid]?.isBot && playerPresence[pid] && !playerPresence[pid].connected ? ' • Offline, session reserved' : ''}
                         </div>
                       </div>
                     </div>
@@ -687,7 +863,7 @@ function App() {
             </p>
           )}
           <button className="btn-ghost btn-action" style={{ marginTop: '1rem', width: '100%' }}
-            onClick={() => setView('MATCHMAKING')}>← Back to Rooms</button>
+            onClick={() => { resetActiveSession(); setView('MATCHMAKING'); }}>← Back to Rooms</button>
         </motion.div>
       </div>
     );
@@ -896,11 +1072,11 @@ function App() {
         <div className="victory-overlay">
           <motion.div className="glass-panel victory-card" initial={{ scale: 0 }} animate={{ scale: 1 }}>
             <h1>🏆 {gs.winner === userId ? 'YOU WIN!' : `${gs.players[gs.winner]?.username || 'Player'} Wins!`}</h1>
-            <p style={{ fontSize: '1.2rem', marginBottom: '1rem' }}>{totalVP()} Victory Points</p>
+            <button className="btn-action btn-lg" style={{ marginBottom: '0.75rem' }} onClick={() => emit('create_rematch')}>
+              Rematch
+            </button>
             <button className="btn-action btn-lg" onClick={() => {
-              localStorage.removeItem('catan_game_id');
-              localStorage.removeItem('catan_room_code');
-              setGameState(null);
+              resetActiveSession();
               setView('MATCHMAKING');
             }}>Back to Lobby</button>
           </motion.div>
@@ -911,10 +1087,15 @@ function App() {
       <div className="game-top-bar">
         <div style={{ display: 'flex', alignItems: 'center', gap: '12px' }}>
           <button className="btn-action btn-ghost" style={{ padding: '4px 10px', fontSize: '0.75rem' }}
-            onClick={() => setView('MATCHMAKING')}>← Leave</button>
+            onClick={() => { resetActiveSession(); setView('MATCHMAKING'); }}>← Leave</button>
           <span style={{ fontSize: '0.8rem', color: 'var(--text-dim)' }}>
             {isSetup ? `Setup ${gs?.phase === 'SETUP_R1' ? 'R1' : 'R2'}` : 'Game'} • {authUser.username}
           </span>
+          {!isConnected && (
+            <span style={{ fontSize: '0.75rem', color: '#fbbf24', fontWeight: 700 }}>
+              Reconnecting... session preserved
+            </span>
+          )}
         </div>
         <div className="scoreboard">
           {gs?.playerOrder.map((pid, i) => {
@@ -927,6 +1108,9 @@ function App() {
                   <span style={{ color: gs.players[pid].color, fontWeight: 700, fontSize: '0.9rem' }}>{gs.players[pid].username || `P${i + 1}`}</span>
                   <span>{gs.players[pid].score}VP</span>
                   {pid === userId && <span style={{ fontSize: '0.7rem' }}>⭐</span>}
+                  {!gs.players[pid].isBot && playerPresence[pid] && !playerPresence[pid].connected && (
+                    <span style={{ fontSize: '0.7rem', color: '#fbbf24' }}>offline</span>
+                  )}
                   <span style={{ fontSize: '0.7rem', color: 'var(--text-dim)', marginLeft: '4px' }}>
                     {Object.values(gs.players[pid].resources).reduce((a: number, b: number) => a + b, 0)}🃏
                     {' '}·{' '}
