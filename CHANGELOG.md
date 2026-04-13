@@ -29,6 +29,18 @@ Acest document va urmări progresul tehnic pentru proiectul Catan, creat pas cu 
 - **Cloud Infrastructure (Supabase):** Full migration to production PostgreSQL. Configured for Transaction (Port 6543) and Session (Port 5432) poolers for stability.
 - **Health Monitoring:** Added `/health` endpoint for Render cluster monitoring.
 
+## [Gameplay & AI Upgrade] - 2026-04-13
+### Added
+- **Dynamic Trade Modal:** The trade interface now prominently displays the current user's resources, enabling faster decision-making for both the proposer and the receiver.
+- **Animated Game Event Overlays:** Stealing a card or playing any Development Card (Knight, Year of Plenty, Monopoly, Road Building) now broadcasts to all players with a large, beautiful, animated central-screen overlay.
+- **Bot "Longest Road & Army" Strategies:** Bots proactively extend roads seeking the Longest Road bonus, and actively purchase/play dev cards aiming for Largest Army.
+- **Intelligent Bot Trading:** Bots now deeply evaluate proposed trades based on resource scarcity, current needs, and their goal to build cities/settlements. They will only accept trades that strongly favor their progression.
+- **Proactive Bot Trade Offers:** Bots can now propose deals to human players if they have a surplus of one resource and a severe deficit in a required resource. 
+
+### Fixed
+- **Dismissed Trades Sync:** Trade offers now properly disappear from the screen only when *all* other users (and bots) explicitly reject/dismiss the trade.
+- **Robber Discard Freeze:** Fixed a game-breaking state hook where bots holding >7 cards when a 7 was rolled on another player's turn failed to discard, causing infinite hangs.
+
 ## [Unreleased]
 - **Arhitectură Generală:** S-a stabilit arhitectura distribuită Backend (Node.js + Socket.io) și Frontend (React + Vite).
 - **Frontend Assets:** Integrare texturi premium și sisteme de coordonate axiale pentru hexagoane.

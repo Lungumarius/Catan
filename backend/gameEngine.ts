@@ -33,6 +33,22 @@ export interface TradeOffer {
   fromPlayer: string;
   offering: Partial<Resources>;
   requesting: Partial<Resources>;
+  rejectedBy: string[];
+}
+
+export interface GameEvent {
+  type: 'dev_card' | 'steal';
+  eventId: string;
+  playerId: string;
+  playerName: string;
+  playerColor: string;
+  card?: string;
+  details?: {
+    knightsTotal?: number;
+    res1?: string; res2?: string;
+    resource?: string; stolen?: number;
+    stolenFrom?: string; stolenFromName?: string; stolenFromColor?: string; stolenRes?: string;
+  };
 }
 
 export type BuildingType = 'settlement' | 'city';
@@ -159,6 +175,11 @@ export class GameEngine {
 
   // Road building dev card state
   roadBuildingRemaining: number = 0;
+
+  // Last game event (dev card play, steal) — emitted once then cleared
+  lastEvent: GameEvent | null = null;
+  private _lastEventId: number = 0;
+  private _mkEventId(): string { return `${Date.now()}-${++this._lastEventId}`; }
 
   // ─────────────────────────────────────────
   //  INIT & HYDRATION
@@ -620,7 +641,18 @@ export class GameEngine {
           const stolenRes = this.stealRandomResource(victim);
           if (stolenRes) {
             this.players[userId].resources[stolenRes] += 1;
+            const vp = this.players[userId];
             this.addLog(`${this.playerName(userId)} stole 1 card from ${this.playerName(stealFromPlayer)}`);
+            this.lastEvent = {
+              type: 'steal', eventId: this._mkEventId(),
+              playerId: userId, playerName: this.playerName(userId), playerColor: vp.color,
+              details: {
+                stolenFrom: stealFromPlayer,
+                stolenFromName: this.playerName(stealFromPlayer),
+                stolenFromColor: victim.color,
+                stolenRes,
+              }
+            };
           }
         }
       }
@@ -724,29 +756,35 @@ export class GameEngine {
 
     switch (card.type) {
       case 'knight': {
-        // Knight: move robber (similar to rolling 7 but no discard)
         p.knightsPlayed++;
         this.addLog(`${this.playerName(userId)} played a Knight (${p.knightsPlayed} total)`);
         this.recalcLargestArmy();
-        // Set phase to ROBBER_MOVE (skip discard)
         this.turnPhase = 'ROBBER_MOVE';
         p.devCards.splice(cardIndex, 1);
         this.checkVictory(userId);
+        this.lastEvent = {
+          type: 'dev_card', eventId: this._mkEventId(),
+          playerId: userId, playerName: this.playerName(userId), playerColor: p.color,
+          card: 'knight', details: { knightsTotal: p.knightsPlayed }
+        };
         return null;
       }
 
       case 'yearOfPlenty': {
-        // Take 2 free resources from bank
         if (!payload?.res1 || !payload?.res2) return 'Must specify 2 resources';
         p.resources[payload.res1 as ResourceType] += 1;
         p.resources[payload.res2 as ResourceType] += 1;
         this.addLog(`${this.playerName(userId)} played Year of Plenty (${payload.res1}, ${payload.res2})`);
         p.devCards.splice(cardIndex, 1);
+        this.lastEvent = {
+          type: 'dev_card', eventId: this._mkEventId(),
+          playerId: userId, playerName: this.playerName(userId), playerColor: p.color,
+          card: 'yearOfPlenty', details: { res1: payload.res1, res2: payload.res2 }
+        };
         return null;
       }
 
       case 'monopoly': {
-        // Take ALL of one resource type from ALL other players
         if (!payload?.resource) return 'Must specify resource type';
         const res = payload.resource as ResourceType;
         let stolen = 0;
@@ -759,14 +797,23 @@ export class GameEngine {
         p.resources[res] += stolen;
         this.addLog(`${this.playerName(userId)} played Monopoly on ${res} → stole ${stolen}`);
         p.devCards.splice(cardIndex, 1);
+        this.lastEvent = {
+          type: 'dev_card', eventId: this._mkEventId(),
+          playerId: userId, playerName: this.playerName(userId), playerColor: p.color,
+          card: 'monopoly', details: { resource: res, stolen }
+        };
         return null;
       }
 
       case 'roadBuilding': {
-        // Place 2 free roads
         this.roadBuildingRemaining = 2;
         this.addLog(`${this.playerName(userId)} played Road Building`);
         p.devCards.splice(cardIndex, 1);
+        this.lastEvent = {
+          type: 'dev_card', eventId: this._mkEventId(),
+          playerId: userId, playerName: this.playerName(userId), playerColor: p.color,
+          card: 'roadBuilding', details: {}
+        };
         return null;
       }
     }
@@ -819,12 +866,11 @@ export class GameEngine {
     if (this.playerOrder[this.currentTurnIndex] !== userId) return 'Not your turn';
 
     const p = this.players[userId];
-    // Verify player has the offered resources
     for (const [res, amount] of Object.entries(offering)) {
       if (amount && p.resources[res as ResourceType] < amount) return `Not enough ${res}`;
     }
 
-    this.activeTradeOffer = { fromPlayer: userId, offering, requesting };
+    this.activeTradeOffer = { fromPlayer: userId, offering, requesting, rejectedBy: [] };
     this.addLog(`${this.playerName(userId)} proposed a trade`);
     return null;
   }
@@ -861,8 +907,92 @@ export class GameEngine {
   }
 
   rejectTrade(userId: string): string | null {
-    this.activeTradeOffer = null;
+    if (!this.activeTradeOffer) return null;
+    // Proposer cancels their own offer
+    if (userId === this.activeTradeOffer.fromPlayer) {
+      this.activeTradeOffer = null;
+      return null;
+    }
+    // Track who has dismissed
+    if (!this.activeTradeOffer.rejectedBy.includes(userId)) {
+      this.activeTradeOffer.rejectedBy.push(userId);
+    }
+    // Clear only when ALL non-proposers have dismissed
+    const nonProposers = this.playerOrder.filter(pid => pid !== this.activeTradeOffer!.fromPlayer);
+    if (nonProposers.every(pid => this.activeTradeOffer!.rejectedBy.includes(pid))) {
+      this.addLog(`Trade offer expired — all dismissed`);
+      this.activeTradeOffer = null;
+    }
     return null;
+  }
+
+  // ─────────────────────────────────────────
+  //  BOT TRADE EVALUATION
+  // ─────────────────────────────────────────
+
+  evaluateBotsForTrade(proposerId: string): void {
+    if (!this.activeTradeOffer) return;
+    const bots = this.playerOrder.filter(pid => this.players[pid]?.isBot && pid !== proposerId);
+    for (const botId of bots) {
+      if (!this.activeTradeOffer) break; // Already accepted
+      if (this.botShouldAcceptTrade(botId)) {
+        this.acceptTrade(botId);
+        return;
+      } else {
+        this.rejectTrade(botId);
+      }
+    }
+  }
+
+  private botShouldAcceptTrade(botId: string): boolean {
+    if (!this.activeTradeOffer) return false;
+    const offer = this.activeTradeOffer;
+    const bot = this.players[botId];
+    // Can bot fulfill? (has what proposer wants?)
+    for (const [res, amount] of Object.entries(offer.requesting)) {
+      if ((amount ?? 0) > 0 && bot.resources[res as ResourceType] < (amount ?? 0)) return false;
+    }
+    // Value function: how much does the bot need this resource?
+    const valueForBot = (res: string, amount: number): number => {
+      const r = res as ResourceType;
+      const p = bot;
+      const total = this.totalResources(p);
+      const have = p.resources[r];
+      const scarcity = total > 0 ? Math.max(0, 1 - (have / Math.max(1, total))) : 1;
+      const cityScore = (r === 'wheat' || r === 'ore') ? 2.5 : 0;
+      const settlScore = (r === 'wood' || r === 'brick' || r === 'sheep' || r === 'wheat') ? 1.5 : 0;
+      const devScore = (r === 'sheep' || r === 'wheat' || r === 'ore') ? 1.5 : 0;
+      return amount * (cityScore + settlScore + devScore) * (1 + scarcity);
+    };
+    let getScore = 0, giveScore = 0;
+    for (const [res, amount] of Object.entries(offer.offering)) {
+      if (amount) getScore += valueForBot(res, amount);
+    }
+    for (const [res, amount] of Object.entries(offer.requesting)) {
+      if (amount) giveScore += valueForBot(res, amount);
+    }
+    // Very restrictive: bot only accepts if it gets ≥50% more value than it gives
+    return getScore >= giveScore * 1.5;
+  }
+
+  getBotTradeOffer(botId: string): { offering: Partial<Resources>; requesting: Partial<Resources> } | null {
+    const p = this.players[botId];
+    const resTypes: ResourceType[] = ['wood', 'brick', 'sheep', 'wheat', 'ore'];
+    // Need a surplus of 3+ of one resource
+    const surplus = resTypes.find(r => p.resources[r] >= 3);
+    if (!surplus) return null;
+    const needed = this.getMostNeededResources(botId);
+    const request = needed.find(r => r !== surplus);
+    if (!request) return null;
+    // Only offer if a human player has what we need
+    const humanHas = this.playerOrder.some(pid =>
+      !this.players[pid].isBot && pid !== botId && this.players[pid].resources[request] >= 1
+    );
+    if (!humanHas) return null;
+    return {
+      offering: { [surplus]: 2 } as Partial<Resources>,
+      requesting: { [request]: 1 } as Partial<Resources>,
+    };
   }
 
   // ─────────────────────────────────────────
@@ -1023,13 +1153,15 @@ export class GameEngine {
       const victim = this.getVictimAtHex(bestHex, botId);
       this.moveRobber(botId, bestHex, victim);
     } else if (this.turnPhase === 'FREE_ACTION') {
-      // Greedily build what we can
+      // Play dev cards first (before building)
+      this.playBotDevCards(botId);
+
       let builtSomething = true;
       let limit = 0;
-      while (builtSomething && limit < 10) {
+      while (builtSomething && limit < 12) {
         limit++;
         builtSomething = false;
-        
+
         // 1. Upgrade to city
         const mySettlements = Object.entries(this.buildings).filter(([_, b]) => b.owner === botId && b.type === 'settlement');
         for (const [vid] of mySettlements) {
@@ -1037,60 +1169,119 @@ export class GameEngine {
         }
         if (builtSomething) continue;
 
-        // 2. Build settlement
+        // 2. Build settlement (only if road is connected)
         const bestVertex = this.getBestVertexForBot(botId);
         if (bestVertex && this.placeSettlement(botId, bestVertex) === null) { builtSomething = true; continue; }
 
-        // 3. Build road
+        // 3. Build road (scoring towards longest road)
         const bestEdge = this.getBestEdgeForBot(botId);
         if (bestEdge && this.placeRoad(botId, bestEdge) === null) { builtSomething = true; continue; }
 
-        // 4. Bank trade if needed for settlement
+        // 4. Bank trade to get what we need
         if (this.totalResources(this.players[botId]) >= 4) {
-          const p = this.players[botId];
-          const needed: ResourceType[] = ['wood', 'brick', 'sheep', 'wheat'];
-          const missing = needed.find(r => p.resources[r] === 0);
-          const surplus = (['wood', 'brick', 'sheep', 'wheat', 'ore'] as ResourceType[]).find(r => p.resources[r] >= 4);
-          if (missing && surplus) {
-            if (this.bankTrade(botId, surplus, missing) === null) { builtSomething = true; continue; }
+          const needed4 = this.getMostNeededResources(botId);
+          const botRes = this.players[botId];
+          const surplus4 = (['wood', 'brick', 'sheep', 'wheat', 'ore'] as ResourceType[]).find(r => botRes.resources[r] >= 4);
+          const missing4 = needed4.find(r => r !== surplus4 && botRes.resources[r] === 0);
+          if (missing4 && surplus4) {
+            if (this.bankTrade(botId, surplus4, missing4) === null) { builtSomething = true; continue; }
           }
         }
 
-        // 5. Buy dev card
-        if (this.buyDevCard(botId) === null) { builtSomething = true; continue; }
+        // 5. Buy dev card (for army strategy)
+        const botPlayer = this.players[botId];
+        const goingForArmy = this.largestArmyHolder !== botId && botPlayer.knightsPlayed >= 1;
+        if (goingForArmy || this.devCardDeck.length > 0) {
+          if (this.buyDevCard(botId) === null) { builtSomething = true; continue; }
+        }
 
-        // 6. Play Dev Cards (Knight, Year of Plenty)
-        this.playBotDevCards(botId);
+        // 6. Propose trade if stuck with surplus
+        if (!this.activeTradeOffer) {
+          const tradeOffer = this.getBotTradeOffer(botId);
+          if (tradeOffer) {
+            const err = this.proposeTrade(botId, tradeOffer.offering, tradeOffer.requesting);
+            if (!err) {
+              // Bots auto-evaluate immediately (other bots accept/reject)
+              this.evaluateBotsForTrade(botId);
+              if (!this.activeTradeOffer) { builtSomething = true; continue; } // Accepted!
+            }
+          }
+        }
       }
       this.endTurn(botId);
+
     }
   }
 
   private playBotDevCards(botId: string) {
     const p = this.players[botId];
-    if (p.devCards.length === 0) return;
+    if (p.devCards.length === 0 || p.hasPlayedDevCardThisTurn) return;
 
-    // 1. Play Knight if robber blocks a high-yield hex
+    // 1. Knight: play aggressively for Largest Army
     const knightIndex = p.devCards.findIndex(c => c.type === 'knight' && !c.boughtThisTurn);
     if (knightIndex !== -1) {
-      const yieldScore = this.board.find(h => `${h.q},${h.r}` === this.robberHex && this.isBotAffectedByRobber(botId));
-      if (yieldScore) {
+      const robberAffects = this.isBotAffectedByRobber(botId);
+      const alreadyHoldsArmy = this.largestArmyHolder === botId;
+      const leaderKnights = Math.max(0, ...this.playerOrder.map(pid => this.players[pid].knightsPlayed));
+      const goingForArmy = !alreadyHoldsArmy && (p.knightsPlayed >= 2 || p.knightsPlayed >= leaderKnights);
+      if (robberAffects || goingForArmy) {
         const bestHex = this.getBestRobberHexForBot(botId);
         const victim = this.getVictimAtHex(bestHex, botId);
         this.playDevCard(botId, knightIndex, { hexCoord: bestHex, victimId: victim || undefined });
-        return; // Only 1 card per turn
+        return;
       }
     }
 
-    // 2. Year of Plenty if exactly 2 resources away from a Settlement
-    const yopIndex = p.devCards.findIndex(c => c.type === 'yearOfPlenty' && !c.boughtThisTurn);
-    if (yopIndex !== -1) {
-      // Basic check: do we have at least 2 resources but missing others?
-      const total = this.totalResources(p);
-      if (total >= 2 && total < 4) {
-        this.playDevCard(botId, yopIndex, { res1: 'wood', res2: 'brick' });
+    // 2. Monopoly: steal most-stockpiled resource
+    const monoIndex = p.devCards.findIndex(c => c.type === 'monopoly' && !c.boughtThisTurn);
+    if (monoIndex !== -1) {
+      const resCount: Record<string, number> = { wood: 0, brick: 0, sheep: 0, wheat: 0, ore: 0 };
+      this.playerOrder.filter(pid => pid !== botId).forEach(pid => {
+        const pr = this.players[pid].resources;
+        for (const r of Object.keys(resCount)) resCount[r] += pr[r as ResourceType] || 0;
+      });
+      const [bestRes, bestAmt] = Object.entries(resCount).sort((a, b) => b[1] - a[1])[0];
+      if (bestAmt >= 2) {
+        this.playDevCard(botId, monoIndex, { resource: bestRes });
+        return;
       }
     }
+
+    // 3. Year of Plenty: grab what we need most
+    const yopIndex = p.devCards.findIndex(c => c.type === 'yearOfPlenty' && !c.boughtThisTurn);
+    if (yopIndex !== -1) {
+      const needed = this.getMostNeededResources(botId);
+      if (needed.length >= 1) {
+        const res1 = needed[0] || 'wheat';
+        const res2 = needed[1] || needed[0] || 'ore';
+        this.playDevCard(botId, yopIndex, { res1, res2 });
+      }
+    }
+  }
+
+  private getMostNeededResources(botId: string): ResourceType[] {
+    const p = this.players[botId];
+    const scores: Partial<Record<ResourceType, number>> = { wood: 0, brick: 0, sheep: 0, wheat: 0, ore: 0 };
+    const mySettlements = Object.values(this.buildings).filter(b => b.owner === botId);
+    const hasCity = mySettlements.some(b => b.type === 'city');
+    // City priority
+    if (p.resources.wheat < 2) scores.wheat = (scores.wheat ?? 0) + 4;
+    if (p.resources.ore < 3) scores.ore = (scores.ore ?? 0) + 4;
+    if (!hasCity) {
+      // Settlement priority  
+      if (p.resources.wood === 0) scores.wood = (scores.wood ?? 0) + 3;
+      if (p.resources.brick === 0) scores.brick = (scores.brick ?? 0) + 3;
+      if (p.resources.sheep === 0) scores.sheep = (scores.sheep ?? 0) + 3;
+    }
+    // Road for longest road
+    if (p.resources.wood === 0) scores.wood = (scores.wood ?? 0) + 2;
+    if (p.resources.brick === 0) scores.brick = (scores.brick ?? 0) + 2;
+    // Dev for army
+    if (p.resources.sheep === 0) scores.sheep = (scores.sheep ?? 0) + 2;
+    const resTypes: ResourceType[] = ['wood', 'brick', 'sheep', 'wheat', 'ore'];
+    return resTypes
+      .filter(r => (scores[r] ?? 0) > 0)
+      .sort((a, b) => (scores[b] ?? 0) - (scores[a] ?? 0));
   }
 
   private isBotAffectedByRobber(botId: string): boolean {
@@ -1151,23 +1342,40 @@ export class GameEngine {
   }
 
   private getBestEdgeForBot(botId: string): string | null {
-    const possibleEdges: string[] = [];
+    const myRoadLength = this.calcLongestRoadForPlayer(botId);
+    const scored: Array<{ eid: string; score: number }> = [];
+
     this.board.forEach(hex => {
       const { x, y } = getPixelPos(hex.q, hex.r);
       const verts = getVerticesForHex(x, y);
       verts.forEach((v1, i, arr) => {
         const v2 = arr[(i + 1) % 6];
         const eid = [v1, v2].sort().join(':');
-        if (!this.roads[eid]) {
-          const connected = (this.buildings[v1]?.owner === botId || this.buildings[v2]?.owner === botId) ||
-            Object.entries(this.roads).some(([rid, rOwner]) => rOwner === botId && (rid.split(':').includes(v1) || rid.split(':').includes(v2)));
-          if (connected) possibleEdges.push(eid);
-        }
+        if (this.roads[eid]) return;
+        const connected =
+          (this.buildings[v1]?.owner === botId || this.buildings[v2]?.owner === botId) ||
+          Object.entries(this.roads).some(([rid, rOwner]) =>
+            rOwner === botId && (rid.split(':').includes(v1) || rid.split(':').includes(v2)));
+        if (!connected) return;
+
+        let score = 1;
+        // Simulate: temporarily add this road and check new road length
+        this.roads[eid] = botId;
+        const newLen = this.calcLongestRoadForPlayer(botId);
+        delete this.roads[eid];
+        if (newLen > myRoadLength) score += (newLen - myRoadLength) * 5;
+
+        // Bonus if edge leads toward best settlement vertex
+        const bestV = this.getBestVertexForBot(botId);
+        if (bestV && (v1 === bestV || v2 === bestV)) score += 3;
+
+        scored.push({ eid, score });
       });
     });
 
-    if (possibleEdges.length === 0) return null;
-    return possibleEdges[Math.floor(Math.random() * possibleEdges.length)];
+    if (scored.length === 0) return null;
+    scored.sort((a, b) => b.score - a.score);
+    return scored[0].eid;
   }
 
   private getBestRobberHexForBot(botId: string): string {
@@ -1277,6 +1485,7 @@ export class GameEngine {
       winner: this.winner,
       setupInfo: this.getSetupInfo(),
       roadBuildingRemaining: this.roadBuildingRemaining,
+      lastEvent: this.lastEvent,
     };
   }
 }

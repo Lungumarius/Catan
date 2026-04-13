@@ -187,48 +187,50 @@ async function handleAction(
 }
 
 function checkForBotTurn(gameId: string) {
-  const result = activeEngines.get(gameId);
-  if (!result) return;
+  const engine = activeEngines.get(gameId);
+  if (!engine) return;
 
-  const state = result.getState();
+  const state = engine.getState();
   if (state.phase === 'GAME_OVER') return;
 
   let botId: string | null = null;
-  if (state.phase === 'SETUP_R1' || state.phase === 'SETUP_R2') {
+
+  // ROBBER_DISCARD: ANY bot that must discard (regardless of whose turn)
+  if (state.phase === 'MAIN_GAME' && state.turnPhase === 'ROBBER_DISCARD') {
+    botId = state.playersWhoMustDiscard.find(pid => engine.players[pid]?.isBot) || null;
+  } else if (state.phase === 'SETUP_R1' || state.phase === 'SETUP_R2') {
     const cur = state.setupInfo?.currentPlayer;
-    if (cur && result.players[cur]?.isBot) botId = cur;
+    if (cur && engine.players[cur]?.isBot) botId = cur;
   } else if (state.phase === 'MAIN_GAME') {
     const cur = state.playerOrder[state.currentTurnIndex];
-    if (result.players[cur]?.isBot) {
-      // In main game, bots also need to handle discard phase if they are in the list
-      if (state.turnPhase === 'ROBBER_DISCARD') {
-        botId = state.playersWhoMustDiscard.find(pid => result.players[pid]?.isBot) || null;
-      } else {
-        botId = cur;
-      }
-    }
+    if (engine.players[cur]?.isBot) botId = cur;
   }
 
   if (botId) {
     logger.info(`Scheduling bot turn for ${botId} in ${gameId}`);
     io.to(gameId).emit('bot_thinking', { userId: botId });
 
-    const delay = 2500 + Math.random() * 2000;
+    const delay = 2000 + Math.random() * 1500;
     setTimeout(async () => {
-      const engine = activeEngines.get(gameId);
-      if (!engine) return;
-      
-      if (engine.phase === 'SETUP_R1' || engine.phase === 'SETUP_R2') {
-        engine.executeBotSetup(botId!);
+      const eng = activeEngines.get(gameId);
+      if (!eng) return;
+
+      if (eng.phase === 'SETUP_R1' || eng.phase === 'SETUP_R2') {
+        eng.executeBotSetup(botId!);
       } else {
-        engine.executeBotTurn(botId!);
+        eng.executeBotTurn(botId!);
       }
-      
-      const newState = engine.getState();
+
+      const newState = eng.getState();
       await saveCheckpoint(gameId);
-      io.to(gameId).emit('game_state', newState);
-      
-      // Recurse if next is also a bot
+      const gameRecord = await prisma.game.findUnique({ where: { id: gameId }, select: { status: true } });
+      io.to(gameId).emit('game_state', { ...newState, status: gameRecord?.status || 'STARTED' });
+
+      if (newState.phase === 'GAME_OVER' && newState.winner) {
+        await handleGameOver(gameId, eng);
+        return;
+      }
+
       checkForBotTurn(gameId);
     }, delay);
   }
@@ -460,8 +462,21 @@ io.on('connection', (socket) => {
 
   // ── P2P TRADE ──
 
-  socket.on('propose_trade', (data) => {
-    handleAction(socket, data, (engine) => engine.proposeTrade(data.userId, data.offering, data.requesting));
+  socket.on('propose_trade', async (data) => {
+    const gameId = data.gameId;
+    const result = await getOrInitGame(gameId);
+    if (!result) { socket.emit('action_error', 'Game not found'); return; }
+
+    const error = result.engine.proposeTrade(data.userId, data.offering, data.requesting);
+    if (error) { socket.emit('action_error', error); return; }
+
+    // All bots immediately evaluate and respond
+    result.engine.evaluateBotsForTrade(data.userId);
+
+    const engineState = result.engine.getState();
+    await saveCheckpoint(gameId);
+    const gameRecord = await prisma.game.findUnique({ where: { id: gameId }, select: { status: true } });
+    io.to(gameId).emit('game_state', { ...engineState, status: gameRecord?.status || 'STARTED' });
   });
 
   socket.on('accept_trade', (data) => {

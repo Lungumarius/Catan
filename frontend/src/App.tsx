@@ -18,7 +18,22 @@ interface PlayerState {
   isBot: boolean;
 }
 interface Building { owner: string; type: 'settlement' | 'city'; }
-interface TradeOffer { fromPlayer: string; offering: Partial<Resources>; requesting: Partial<Resources>; }
+interface TradeOffer { fromPlayer: string; offering: Partial<Resources>; requesting: Partial<Resources>; rejectedBy?: string[]; }
+
+interface GameEvent {
+  type: 'dev_card' | 'steal';
+  eventId: string;
+  playerId: string;
+  playerName: string;
+  playerColor: string;
+  card?: string;
+  details?: {
+    knightsTotal?: number;
+    res1?: string; res2?: string;
+    resource?: string; stolen?: number;
+    stolenFrom?: string; stolenFromName?: string; stolenFromColor?: string; stolenRes?: string;
+  };
+}
 
 export interface GameState {
   status?: string;
@@ -35,7 +50,9 @@ export interface GameState {
   log: string[]; winner: string | null;
   setupInfo: { currentPlayer: string; expectedAction: string } | null;
   roadBuildingRemaining: number;
+  lastEvent?: GameEvent | null;
 }
+
 
 const RES: Record<string, string> = { wood: '🪵', brick: '🧱', sheep: '🐑', wheat: '🌾', ore: '🪨' };
 const ZERO_RES = (): Resources => ({ wood: 0, brick: 0, sheep: 0, wheat: 0, ore: 0 });
@@ -180,6 +197,17 @@ function App() {
   const [globalFlies, setGlobalFlies] = useState<{ id: number; pid: string; res: string; amount: number; isGain: boolean }[]>([]);
   const prevPlayersRef = useRef<Record<string, PlayerState> | null>(null);
   const flyIdRef = useRef(0);
+
+  // Dev Card / Steal event overlay
+  const [devCardEvent, setDevCardEvent] = useState<GameEvent | null>(null);
+  const lastShownEventId = useRef<string | null>(null);
+  useEffect(() => {
+    if (devCardEvent) {
+      const t = setTimeout(() => setDevCardEvent(null), 3500);
+      return () => clearTimeout(t);
+    }
+  }, [devCardEvent]);
+
 
   useEffect(() => {
     const handleKey = (e: KeyboardEvent) => {
@@ -365,6 +393,13 @@ function App() {
         setView('GAME');
       }
       setIsRejoining(false);
+
+      // Dev card / steal event overlay
+      if (st.lastEvent && st.lastEvent.eventId !== lastShownEventId.current) {
+        lastShownEventId.current = st.lastEvent.eventId;
+        setDevCardEvent(st.lastEvent);
+      }
+
 
       // If finished game session, clear it from storage
       if (st.status === 'FINISHED') {
@@ -685,7 +720,121 @@ function App() {
 
 
 
+      {/* DEV CARD / STEAL EVENT OVERLAY */}
+      <AnimatePresence>
+        {devCardEvent && (
+          <motion.div
+            key={devCardEvent.eventId}
+            initial={{ opacity: 0 }}
+            animate={{ opacity: 1 }}
+            exit={{ opacity: 0 }}
+            style={{
+              position: 'fixed', inset: 0, zIndex: 9800,
+              display: 'flex', alignItems: 'center', justifyContent: 'center',
+              background: 'rgba(0,0,0,0.6)', backdropFilter: 'blur(6px)',
+              pointerEvents: 'none',
+            }}
+          >
+            <motion.div
+              initial={{ scale: 0.2, y: 80, rotate: -10 }}
+              animate={{ scale: 1, y: 0, rotate: 0 }}
+              exit={{ scale: 0.4, y: -60, opacity: 0 }}
+              transition={{ type: 'spring', stiffness: 280, damping: 22 }}
+              style={{
+                background: 'linear-gradient(135deg, rgba(10,12,28,0.99) 0%, rgba(25,15,55,0.99) 100%)',
+                border: `2.5px solid ${devCardEvent.playerColor}`,
+                borderRadius: '24px',
+                padding: '2.2rem 3rem',
+                textAlign: 'center',
+                boxShadow: `0 0 80px ${devCardEvent.playerColor}55, 0 25px 70px rgba(0,0,0,0.9)`,
+                maxWidth: '420px',
+                width: '88vw',
+              }}
+            >
+              <motion.div initial={{ opacity: 0, y: -12 }} animate={{ opacity: 1, y: 0 }} transition={{ delay: 0.1 }}>
+                <div style={{ fontSize: '0.72rem', color: 'rgba(255,255,255,0.4)', letterSpacing: '2.5px', textTransform: 'uppercase', marginBottom: '6px' }}>
+                  {devCardEvent.type === 'steal' ? '🏴‍☠️ Robber' : '🃏 Card Played'}
+                </div>
+                <div style={{ fontSize: '1.5rem', fontWeight: 900, color: devCardEvent.playerColor, marginBottom: '0.4rem', textShadow: `0 0 20px ${devCardEvent.playerColor}` }}>
+                  {devCardEvent.playerName}
+                </div>
+              </motion.div>
+
+              <motion.div
+                initial={{ scale: 0, rotate: -30 }}
+                animate={{ scale: 1, rotate: 0 }}
+                transition={{ type: 'spring', delay: 0.18, stiffness: 350, damping: 18 }}
+                style={{ fontSize: '5.5rem', margin: '0.4rem 0', lineHeight: 1, filter: `drop-shadow(0 0 20px ${devCardEvent.playerColor})` }}
+              >
+                {devCardEvent.type === 'steal' ? '🏴‍☠️'
+                  : devCardEvent.card === 'knight' ? '⚔️'
+                  : devCardEvent.card === 'yearOfPlenty' ? '🌟'
+                  : devCardEvent.card === 'monopoly' ? '💰'
+                  : devCardEvent.card === 'roadBuilding' ? '🛣️'
+                  : '🃏'}
+              </motion.div>
+
+              <motion.div
+                initial={{ opacity: 0, y: 14 }}
+                animate={{ opacity: 1, y: 0 }}
+                transition={{ delay: 0.32 }}
+                style={{ fontSize: '1.05rem', color: 'rgba(255,255,255,0.75)', lineHeight: 1.6 }}
+              >
+                {devCardEvent.type === 'steal' && devCardEvent.details?.stolenFromName && (
+                  <>
+                    <span style={{ color: '#fbbf24', fontWeight: 700 }}>stole a card</span>
+                    {' from '}
+                    <span style={{ color: devCardEvent.details.stolenFromColor || '#fff', fontWeight: 900 }}>
+                      {devCardEvent.details.stolenFromName}
+                    </span>
+                    {devCardEvent.details.stolenRes && (
+                      <motion.div initial={{ scale: 0 }} animate={{ scale: 1 }} transition={{ delay: 0.45, type: 'spring' }}
+                        style={{ fontSize: '2.5rem', marginTop: '6px' }}>
+                        {RES[devCardEvent.details.stolenRes] || '🃏'}
+                      </motion.div>
+                    )}
+                  </>
+                )}
+                {devCardEvent.card === 'knight' && (
+                  <>
+                    <span style={{ color: '#ef4444', fontWeight: 700 }}>Knight Card!</span>
+                    {devCardEvent.details?.knightsTotal && (
+                      <div style={{ fontSize: '0.85rem', color: 'rgba(255,255,255,0.5)', marginTop: '4px' }}>
+                        {devCardEvent.details.knightsTotal} knights played total
+                      </div>
+                    )}
+                  </>
+                )}
+                {devCardEvent.card === 'yearOfPlenty' && devCardEvent.details?.res1 && (
+                  <>
+                    <span style={{ color: '#fbbf24', fontWeight: 700 }}>Year of Plenty!</span>
+                    <div style={{ fontSize: '2rem', marginTop: '4px' }}>
+                      {RES[devCardEvent.details.res1]} + {RES[devCardEvent.details.res2 || devCardEvent.details.res1]}
+                    </div>
+                  </>
+                )}
+                {devCardEvent.card === 'monopoly' && (
+                  <>
+                    <span style={{ color: '#f97316', fontWeight: 700 }}>Monopoly on </span>
+                    <span style={{ color: '#fbbf24', fontWeight: 900 }}>{devCardEvent.details?.resource}</span>
+                    {(devCardEvent.details?.stolen ?? 0) > 0 && (
+                      <div style={{ color: '#ef4444', marginTop: '4px', fontWeight: 700 }}>
+                        Stole {devCardEvent.details!.stolen} cards from everyone!
+                      </div>
+                    )}
+                  </>
+                )}
+                {devCardEvent.card === 'roadBuilding' && (
+                  <span style={{ color: '#22c55e', fontWeight: 700 }}>Builds 2 free roads!</span>
+                )}
+              </motion.div>
+            </motion.div>
+          </motion.div>
+        )}
+      </AnimatePresence>
+
       {/* ROBBER STEAL PICKER */}
+
       {pendingRobberHex && stealTargets.length > 0 && (
         <div className="steal-picker-overlay">
           <motion.div className="steal-picker-card" initial={{ scale: 0.8, opacity: 0 }} animate={{ scale: 1, opacity: 1 }}>
@@ -1188,19 +1337,42 @@ function App() {
                   </div>
                 </div>
 
-                <div className="trade-actions" style={{ marginTop: '2rem', display: 'flex', gap: '12px' }}>
-                  {gs.activeTradeOffer.fromPlayer !== userId ? (
-                    <>
-                      <button className="btn-action btn-lg" style={{ flex: 2, background: 'var(--success)' }}
-                        onClick={() => emit('accept_trade')}>✅ Accept Trade</button>
-                      <button className="btn-action btn-ghost" style={{ flex: 1 }}
-                        onClick={() => emit('reject_trade')}>Dismiss</button>
-                    </>
-                  ) : (
-                    <button className="btn-action btn-ghost" style={{ width: '100%', border: '1px dashed var(--danger)', color: 'var(--danger)' }}
-                      onClick={() => emit('reject_trade')}>❌ Cancel My Offer</button>
+                <div className="trade-actions" style={{ marginTop: '2rem', display: 'flex', flexDirection: 'column', gap: '12px' }}>
+                  {/* Always show the current player's resources */}
+                  {me && (
+                    <div style={{ padding: '8px 12px', background: 'rgba(0,0,0,0.4)', borderRadius: '10px', border: '1px solid rgba(255,255,255,0.07)' }}>
+                      <div style={{ fontSize: '0.65rem', color: 'var(--text-dim)', letterSpacing: '1.5px', textTransform: 'uppercase', marginBottom: '5px' }}>
+                        Your Resources
+                      </div>
+                      <div style={{ display: 'flex', gap: '10px', justifyContent: 'center', flexWrap: 'wrap' }}>
+                        {(['wood','brick','sheep','wheat','ore'] as ResourceType[]).map(r => (
+                          <span key={r} style={{
+                            fontSize: '0.9rem',
+                            fontWeight: 700,
+                            color: me.resources[r] > 0 ? 'var(--accent)' : 'rgba(255,255,255,0.25)',
+                          }}>
+                            {RES[r]}{me.resources[r]}
+                          </span>
+                        ))}
+                      </div>
+                    </div>
                   )}
+
+                  <div style={{ display: 'flex', gap: '10px' }}>
+                    {gs.activeTradeOffer.fromPlayer !== userId ? (
+                      <>
+                        <button className="btn-action btn-lg" style={{ flex: 2, background: 'var(--success)' }}
+                          onClick={() => emit('accept_trade')}>✅ Accept Trade</button>
+                        <button className="btn-action btn-ghost" style={{ flex: 1 }}
+                          onClick={() => emit('reject_trade')}>Dismiss</button>
+                      </>
+                    ) : (
+                      <button className="btn-action btn-ghost" style={{ width: '100%', border: '1px dashed var(--danger)', color: 'var(--danger)' }}
+                        onClick={() => emit('reject_trade')}>❌ Cancel My Offer</button>
+                    )}
+                  </div>
                 </div>
+
               </motion.div>
             </div>
           )}
