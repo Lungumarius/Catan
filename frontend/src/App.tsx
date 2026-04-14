@@ -874,6 +874,55 @@ function App() {
   // ═══════════════════════════════════════════════════════════
 
   const expectedAction = gs?.setupInfo?.expectedAction;
+  const currentPlayer = curPid && gs ? gs.players[curPid] : null;
+  const winnerPlayer = gs?.winner ? gs.players[gs.winner] : null;
+  const scoreForPlayer = (pid: string) => {
+    if (!gs) return 0;
+    const player = gs.players[pid];
+    if (!player) return 0;
+    let score = player.score;
+    if (gs.longestRoadHolder === pid) score += 2;
+    if (gs.largestArmyHolder === pid) score += 2;
+    score += player.devCards?.filter(card => card.type === 'victoryPoint').length ?? 0;
+    return score;
+  };
+  const sortedStandings = gs
+    ? [...gs.playerOrder].sort((a, b) => scoreForPlayer(b) - scoreForPlayer(a))
+    : [];
+
+  const commandTitle = (() => {
+    if (!gs) return 'Loading Match';
+    if (gs.phase === 'GAME_OVER') return 'Match Complete';
+    if (isSetup) return isMySetupTurn ? `Place ${expectedAction}` : `${currentPlayer?.username || 'Player'} is setting up`;
+    if (!isMyTurn) return `${currentPlayer?.username || 'Player'} is thinking`;
+    if (gs.turnPhase === 'MUST_ROLL') return 'Roll to begin your turn';
+    if (gs.turnPhase === 'ROBBER_DISCARD') return mustDiscard ? 'Discard half your hand' : 'Waiting for discards';
+    if (gs.turnPhase === 'ROBBER_MOVE') return 'Move the robber';
+    return 'Build, trade, or end turn';
+  })();
+
+  const commandSubtitle = (() => {
+    if (!gs) return 'Restoring board state.';
+    if (gs.phase === 'GAME_OVER') return `${winnerPlayer?.username || 'A player'} won the island.`;
+    if (isSetup) return isMySetupTurn ? 'The board is highlighted for your next setup action.' : 'Setup uses snake order before the main game starts.';
+    if (!isMyTurn) return botThinking ? 'Bot action is being resolved.' : 'Watch the board and timeline for updates.';
+    if (gs.turnPhase === 'MUST_ROLL') return 'Dice decide production. Rolling a 7 activates the robber.';
+    if (gs.turnPhase === 'ROBBER_DISCARD') return mustDiscard ? 'Choose exactly the required number of cards.' : 'Other players must discard before robber movement.';
+    if (gs.turnPhase === 'ROBBER_MOVE') return 'Choose a new hex, then steal from an adjacent opponent if possible.';
+    return buildMode ? `Placement mode active: ${buildMode}. Click a valid board spot.` : 'Use the action deck below for your strongest move.';
+  })();
+
+  const renderTimelineIcon = (msg: string) => {
+    if (msg.includes('rolled')) return '🎲';
+    if (msg.includes('robber') || msg.includes('Robber') || msg.includes('stole')) return '🏴‍☠️';
+    if (msg.includes('trade') || msg.includes('Trade')) return '🤝';
+    if (msg.includes('road') || msg.includes('Road')) return '🛤️';
+    if (msg.includes('settlement')) return '🏠';
+    if (msg.includes('city')) return '🏰';
+    if (msg.includes('card') || msg.includes('Knight') || msg.includes('Monopoly')) return '🃏';
+    if (msg.includes('WINS')) return '🏆';
+    return '•';
+  };
 
   return (
     <div className={`game-layout ${isFullscreen ? 'fullscreen-mode' : ''}`} ref={gameLayoutRef} onClick={startMusic}>
@@ -1071,60 +1120,88 @@ function App() {
       {gs?.winner && (
         <div className="victory-overlay">
           <motion.div className="glass-panel victory-card" initial={{ scale: 0 }} animate={{ scale: 1 }}>
-            <h1>🏆 {gs.winner === userId ? 'YOU WIN!' : `${gs.players[gs.winner]?.username || 'Player'} Wins!`}</h1>
-            <button className="btn-action btn-lg" style={{ marginBottom: '0.75rem' }} onClick={() => emit('create_rematch')}>
-              Rematch
-            </button>
-            <button className="btn-action btn-lg" onClick={() => {
-              resetActiveSession();
-              setView('MATCHMAKING');
-            }}>Back to Lobby</button>
+            <div className="victory-kicker">Final Settlement Ledger</div>
+            <h1>🏆 {gs.winner === userId ? 'You conquered Catan' : `${winnerPlayer?.username || 'Player'} Wins`}</h1>
+            <p className="victory-subtitle">
+              {winnerPlayer?.username || 'The winner'} controlled the island with {scoreForPlayer(gs.winner)} victory points.
+            </p>
+            <div className="victory-standings">
+              {sortedStandings.map((pid, index) => {
+                const player = gs.players[pid];
+                const vp = scoreForPlayer(pid);
+                return (
+                  <div key={pid} className={`victory-row ${pid === gs.winner ? 'winner' : ''}`}>
+                    <span className="victory-rank">#{index + 1}</span>
+                    <span className="victory-dot" style={{ backgroundColor: player.color }} />
+                    <span className="victory-name">{player.username}</span>
+                    <span className="victory-badges">
+                      {gs.longestRoadHolder === pid ? '🛤️' : ''}
+                      {gs.largestArmyHolder === pid ? '⚔️' : ''}
+                    </span>
+                    <span className="victory-vp">{vp} VP</span>
+                  </div>
+                );
+              })}
+            </div>
+            <div className="victory-actions">
+              <button className="btn-action btn-lg" onClick={() => emit('create_rematch')}>
+                Rematch
+              </button>
+              <button className="btn-action btn-lg btn-ghost" onClick={() => {
+                resetActiveSession();
+                setView('MATCHMAKING');
+              }}>Back to Lobby</button>
+            </div>
           </motion.div>
         </div>
       )}
 
       {/* TOP BAR */}
       <div className="game-top-bar">
-        <div style={{ display: 'flex', alignItems: 'center', gap: '12px' }}>
-          <button className="btn-action btn-ghost" style={{ padding: '4px 10px', fontSize: '0.75rem' }}
+        <div className="topbar-left">
+          <button className="btn-action btn-ghost topbar-leave"
             onClick={() => { resetActiveSession(); setView('MATCHMAKING'); }}>← Leave</button>
-          <span style={{ fontSize: '0.8rem', color: 'var(--text-dim)' }}>
-            {isSetup ? `Setup ${gs?.phase === 'SETUP_R1' ? 'R1' : 'R2'}` : 'Game'} • {authUser.username}
-          </span>
+          <div className="match-chip">
+            <span className="match-chip-label">{isSetup ? `Setup ${gs?.phase === 'SETUP_R1' ? 'Round 1' : 'Round 2'}` : gs?.phase === 'GAME_OVER' ? 'Complete' : 'Live Match'}</span>
+            <span className="match-chip-user">{authUser.username}</span>
+          </div>
           {!isConnected && (
-            <span style={{ fontSize: '0.75rem', color: '#fbbf24', fontWeight: 700 }}>
-              Reconnecting... session preserved
-            </span>
+            <span className="connection-warning">Reconnecting... session preserved</span>
           )}
         </div>
         <div className="scoreboard">
           {gs?.playerOrder.map((pid, i) => {
             const hasRoad = gs.longestRoadHolder === pid;
             const hasArmy = gs.largestArmyHolder === pid;
+            const player = gs.players[pid];
+            const totalCards = Object.values(player.resources).reduce((a: number, b: number) => a + b, 0);
+            const hiddenVp = player.devCards?.filter(card => card.type === 'victoryPoint').length ?? 0;
+            const visibleVp = player.score
+              + (hasRoad ? 2 : 0)
+              + (hasArmy ? 2 : 0)
+              + hiddenVp;
             return (
               <div key={pid} style={{ position: 'relative' }}>
-                <div className={`score-card ${pid === curPid ? 'active-player' : ''}`}
-                  style={{ borderColor: gs.players[pid].color }}>
-                  <span style={{ color: gs.players[pid].color, fontWeight: 700, fontSize: '0.9rem' }}>{gs.players[pid].username || `P${i + 1}`}</span>
-                  <span>{gs.players[pid].score}VP</span>
-                  {pid === userId && <span style={{ fontSize: '0.7rem' }}>⭐</span>}
-                  {!gs.players[pid].isBot && playerPresence[pid] && !playerPresence[pid].connected && (
-                    <span style={{ fontSize: '0.7rem', color: '#fbbf24' }}>offline</span>
-                  )}
-                  <span style={{ fontSize: '0.7rem', color: 'var(--text-dim)', marginLeft: '4px' }}>
-                    {Object.values(gs.players[pid].resources).reduce((a: number, b: number) => a + b, 0)}🃏
-                    {' '}·{' '}
-                    {gs.players[pid].devCards?.length ?? 0}🎴
-                  </span>
-                  <div style={{ display: 'flex', gap: '4px', marginLeft: '6px' }}>
-                    {hasRoad && (
-                      <motion.span initial={{ scale: 0 }} animate={{ scale: 1 }} title="Longest Road" 
-                        style={{ fontSize: '1.2rem', filter: 'drop-shadow(0 0 5px gold)' }}>🛤️</motion.span>
-                    )}
-                    {hasArmy && (
-                      <motion.span initial={{ scale: 0 }} animate={{ scale: 1 }} title="Largest Army" 
-                        style={{ fontSize: '1.2rem', filter: 'drop-shadow(0 0 5px gold)' }}>⚔️</motion.span>
-                    )}
+                <div className={`score-card ${pid === curPid ? 'active-player' : ''} ${pid === userId ? 'self' : ''}`}
+                  style={{ borderColor: player.color }}>
+                  <div className="score-color" style={{ backgroundColor: player.color }} />
+                  <div className="score-main">
+                    <div className="score-name-row">
+                      <span className="score-name">{player.username || `P${i + 1}`}</span>
+                      {pid === userId && <span className="score-you">You</span>}
+                      {!player.isBot && playerPresence[pid] && !playerPresence[pid].connected && (
+                        <span className="score-offline">offline</span>
+                      )}
+                    </div>
+                    <div className="score-meta">
+                      <span>{totalCards} resources</span>
+                      <span>{player.devCards?.length ?? 0} dev</span>
+                    </div>
+                  </div>
+                  <div className="score-vp">{visibleVp}<span>VP</span></div>
+                  <div className="score-badges">
+                    {hasRoad && <motion.span initial={{ scale: 0 }} animate={{ scale: 1 }} title="Longest Road">🛤️</motion.span>}
+                    {hasArmy && <motion.span initial={{ scale: 0 }} animate={{ scale: 1 }} title="Largest Army">⚔️</motion.span>}
                   </div>
                 </div>
 
@@ -1173,11 +1250,13 @@ function App() {
             );
           })}
         </div>
-        <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+        <div className="topbar-right">
           <button className="btn-fullscreen" onClick={() => toggleFullscreen()}
             title="Toggle fullscreen (F)">⛶ {isFullscreen ? 'Exit' : 'Full'}</button>
-          <div style={{ width: 8, height: 8, borderRadius: '50%', background: isConnected ? 'var(--success)' : 'var(--danger)' }} />
-          <span style={{ fontSize: '0.75rem', color: 'var(--text-dim)' }}>{isConnected ? 'Live' : '...'}</span>
+          <div className={`live-pill ${isConnected ? 'connected' : 'disconnected'}`}>
+            <span />
+            {isConnected ? 'Live' : 'Offline'}
+          </div>
         </div>
       </div>
 
@@ -1201,40 +1280,66 @@ function App() {
             currentPlayerColor={gs?.players[userId]?.color} />
         ) : <div style={{ color: 'var(--text-dim)' }}>Loading board...</div>}
 
+        {buildMode && (
+          <div className="build-mode-coach">
+            <div>
+              <strong>{buildMode === 'road' ? 'Road placement' : buildMode === 'city' ? 'City upgrade' : 'Settlement placement'}</strong>
+              <span>{buildMode === 'road' ? 'Extend from your network. Opponent buildings block paths.' : buildMode === 'city' ? 'Select one of your settlements.' : 'Select a valid connected intersection.'}</span>
+            </div>
+            <button onClick={() => setBuildMode(null)}>Cancel</button>
+          </div>
+        )}
+
         {gs && gs.log && gs.log.length > 0 && (
-          <div className="game-log">
-            {gs.log.slice(-8).map((msg, i) => <div key={i} className="log-entry">{msg}</div>)}
+          <div className="action-timeline">
+            <div className="timeline-header">
+              <span>Island Timeline</span>
+              <small>latest actions</small>
+            </div>
+            {gs.log.slice(-7).reverse().map((msg, i) => (
+              <div key={`${msg}-${i}`} className={`timeline-entry ${i === 0 ? 'latest' : ''}`}>
+                <span className="timeline-icon">{renderTimelineIcon(msg)}</span>
+                <span className="timeline-text">{msg}</span>
+              </div>
+            ))}
           </div>
         )}
       </div>
 
       {/* SIDEBAR */}
       <div className="game-sidebar">
+        <div className={`turn-command-center ${isMyTurn || isMySetupTurn ? 'actionable' : 'observing'}`}>
+          <div className="command-kicker">
+            <span className="command-pulse" />
+            {isMyTurn || isMySetupTurn ? 'Your Command' : 'Table State'}
+          </div>
+          <h2>{commandTitle}</h2>
+          <p>{commandSubtitle}</p>
+          <div className="command-status-row">
+            <span>{isSetup ? 'Setup' : gs?.turnPhase?.replace('_', ' ') || 'Loading'}</span>
+            {currentPlayer && <span style={{ color: currentPlayer.color }}>{currentPlayer.username}</span>}
+          </div>
+          {gs?.phase === 'MAIN_GAME' && isMyTurn && gs.turnPhase === 'MUST_ROLL' && (
+            <button className="btn-action btn-lg command-primary" onClick={() => emit('roll_dice')}>
+              🎲 Roll Dice
+            </button>
+          )}
+          {gs?.phase === 'MAIN_GAME' && isMyTurn && gs.turnPhase === 'FREE_ACTION' && (
+            <button className="btn-action btn-lg command-primary end-turn" onClick={() => emit('end_turn')}>
+              End Turn
+            </button>
+          )}
+          {botThinking && <div className="bot-thinking-chip">Bot is calculating the next move...</div>}
+        </div>
+
         {/* Phase Banner */}
         {isSetup && (
           <div className={`phase-banner ${isMySetupTurn ? 'your-turn' : 'waiting'} ${botThinking ? 'pulsing' : ''}`}>
             {isMySetupTurn ? (
               <><span style={{ fontSize: '1.2rem' }}>{expectedAction === 'settlement' ? '🏠' : '🛤️'}</span>
-              <span>Place your {expectedAction}!</span></>
+              <span>Place your {expectedAction}</span></>
             ) : (
-              <span>
-                {botThinking ? '🤖 Bot is thinking...' : `⏳ P${pIdx(gs?.setupInfo?.currentPlayer ?? '')} is placing...`}
-              </span>
-            )}
-          </div>
-        )}
-
-        {gs?.phase === 'MAIN_GAME' && (
-          <div className={`phase-banner ${isMyTurn ? 'your-turn' : 'waiting'} ${botThinking ? 'pulsing' : ''}`}>
-            {isMyTurn ? (
-              gs.turnPhase === 'MUST_ROLL' ? <span>🎲 Roll the dice!</span> :
-              gs.turnPhase === 'ROBBER_MOVE' ? <span>🏴‍☠️ Move the Robber!</span> :
-              gs.turnPhase === 'ROBBER_DISCARD' ? <span>⚠️ Discard cards</span> :
-              <span>🎯 Build or Trade!</span>
-            ) : (
-              <span>
-                {botThinking ? '🤖 Bot is thinking...' : `⏳ Waiting for P${pIdx(curPid ?? '')}...`}
-              </span>
+              <span>{botThinking ? '🤖 Bot is thinking...' : `⏳ P${pIdx(gs?.setupInfo?.currentPlayer ?? '')} is placing`}</span>
             )}
           </div>
         )}
@@ -1293,13 +1398,6 @@ function App() {
             <button className="btn-action" style={{ width: '100%', background: 'var(--danger)', color: 'white' }}
               onClick={() => emit('robber_discard', { discarded: discardAmounts })}>Confirm Discard</button>
           </div>
-        )}
-
-        {/* Roll */}
-        {gs?.phase === 'MAIN_GAME' && isMyTurn && gs.turnPhase === 'MUST_ROLL' && (
-          <button className="btn-action btn-lg" style={{ width: '100%' }} onClick={() => emit('roll_dice')}>
-            🎲 Roll Dice
-          </button>
         )}
 
         {/* Build & Trade */}
@@ -1406,10 +1504,6 @@ function App() {
                 </div>
               )}
             </div>
-
-            <button className="btn-action end-turn" style={{ width: '100%' }} onClick={() => emit('end_turn')}>
-              End Turn ➡️
-            </button>
           </>
         )}
 
