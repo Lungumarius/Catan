@@ -11,6 +11,7 @@ const COLOR_NAMES = ['Red', 'Blue', 'Green', 'Orange'];
 
 type ResourceType = 'wood' | 'brick' | 'sheep' | 'wheat' | 'ore';
 type Resources = Record<ResourceType, number>;
+type GameExpansion = 'base' | 'seafarers';
 interface DevCard { type: string; boughtThisTurn: boolean; }
 interface PlayerState {
   id: string; username: string; color: string; score: number; resources: Resources;
@@ -19,6 +20,14 @@ interface PlayerState {
 }
 interface Building { owner: string; type: 'settlement' | 'city'; }
 interface TradeOffer { fromPlayer: string; offering: Partial<Resources>; requesting: Partial<Resources>; rejectedBy?: string[]; }
+interface ValidMoves {
+  settlements: string[];
+  roads: string[];
+  ships: string[];
+  movableShips: string[];
+  cities: string[];
+  robberHexes: string[];
+}
 
 interface GameEvent {
   type: 'dev_card' | 'steal';
@@ -37,12 +46,14 @@ interface GameEvent {
 
 export interface GameState {
   status?: string;
+  expansion?: GameExpansion;
   phase: string; turnPhase: string; setupTurnIndex: number;
   players: Record<string, PlayerState>; playerOrder: string[];
   currentTurnIndex: number; diceResult: number | null; dice1: number; dice2: number;
   rollCount: number; lastDiceYields: Record<string, ResourceType[]>;
-  buildings: Record<string, Building>; roads: Record<string, string>;
-  robberHex: string; playersWhoMustDiscard: string[];
+  buildings: Record<string, Building>; roads: Record<string, string>; ships?: Record<string, string>;
+  robberHex: string; pirateHex?: string | null; playersWhoMustDiscard: string[];
+  pendingGoldChoices?: Record<string, number>;
   devCardDeckSize: number;
   longestRoadHolder: string | null; longestRoadLength: number;
   largestArmyHolder: string | null; largestArmySize: number;
@@ -51,11 +62,31 @@ export interface GameState {
   setupInfo: { currentPlayer: string; expectedAction: string } | null;
   roadBuildingRemaining: number;
   lastEvent?: GameEvent | null;
+  validMoves?: Record<string, ValidMoves>;
 }
 
 
 const RES: Record<string, string> = { wood: '🪵', brick: '🧱', sheep: '🐑', wheat: '🌾', ore: '🪨' };
 const ZERO_RES = (): Resources => ({ wood: 0, brick: 0, sheep: 0, wheat: 0, ore: 0 });
+const ACTION_LABELS: Record<string, string> = {
+  place_settlement: 'Placing settlement',
+  place_road: 'Placing road',
+  place_ship: 'Placing ship',
+  move_ship: 'Moving ship',
+  upgrade_city: 'Upgrading city',
+  move_robber: 'Moving robber',
+  robber_discard: 'Discarding cards',
+  roll_dice: 'Rolling dice',
+  end_turn: 'Ending turn',
+  bank_trade: 'Trading with bank',
+  propose_trade: 'Sending trade',
+  accept_trade: 'Accepting trade',
+  reject_trade: 'Updating trade',
+  choose_gold_resource: 'Choosing gold resource',
+  buy_dev_card: 'Buying dev card',
+  play_dev_card: 'Playing dev card',
+  create_rematch: 'Creating rematch',
+};
 
 // ═══════════════════════════════════════════════════════════
 //  DICE DOT PATTERNS
@@ -85,7 +116,7 @@ function DiceFace({ value, size = 52 }: { value: number; size?: number }) {
 //  DICE ROLL ANIMATION COMPONENT
 // ═══════════════════════════════════════════════════════════
 
-function DiceAnimation({ d1, d2, total, onComplete }: { d1: number; d2: number; total: number; onComplete: () => void }) {
+function DiceAnimation({ d1, d2, total, motionMode, onComplete }: { d1: number; d2: number; total: number; motionMode: 'fast' | 'cinematic'; onComplete: () => void }) {
   const [phase, setPhase] = useState<'rolling' | 'result'>('rolling');
   const [rng1, setRng1] = useState(1);
   const [rng2, setRng2] = useState(1);
@@ -96,14 +127,14 @@ function DiceAnimation({ d1, d2, total, onComplete }: { d1: number; d2: number; 
       setRng1(Math.floor(Math.random() * 6) + 1);
       setRng2(Math.floor(Math.random() * 6) + 1);
       frame++;
-      if (frame >= 12) {
+      if (frame >= (motionMode === 'fast' ? 5 : 12)) {
         clearInterval(interval);
         setPhase('result');
-        setTimeout(onComplete, 1800);
+        setTimeout(onComplete, motionMode === 'fast' ? 320 : 1200);
       }
-    }, 80);
+    }, motionMode === 'fast' ? 45 : 70);
     return () => clearInterval(interval);
-  }, [d1, d2, onComplete]);
+  }, [d1, d2, motionMode, onComplete]);
 
   const show1 = phase === 'result' ? d1 : rng1;
   const show2 = phase === 'result' ? d2 : rng2;
@@ -130,6 +161,29 @@ function DiceAnimation({ d1, d2, total, onComplete }: { d1: number; d2: number; 
       )}
     </motion.div>
   );
+}
+
+function resourceTotal(resources: Partial<Resources>) {
+  return Object.values(resources).reduce((sum, amount) => sum + (amount ?? 0), 0);
+}
+
+function scoreTrade(resources: Resources, incoming: Partial<Resources>, outgoing: Partial<Resources>) {
+  const next = { ...resources };
+  for (const [res, amount] of Object.entries(incoming)) next[res as ResourceType] += amount ?? 0;
+  for (const [res, amount] of Object.entries(outgoing)) next[res as ResourceType] -= amount ?? 0;
+
+  const plans = [
+    { cost: { wood: 0, brick: 0, sheep: 0, wheat: 2, ore: 3 }, weight: 12 },
+    { cost: { wood: 1, brick: 1, sheep: 1, wheat: 1, ore: 0 }, weight: 9 },
+    { cost: { wood: 0, brick: 0, sheep: 1, wheat: 1, ore: 1 }, weight: 5 },
+    { cost: { wood: 1, brick: 1, sheep: 0, wheat: 0, ore: 0 }, weight: 4 },
+  ] as const;
+
+  return plans.reduce((score, plan) => {
+    const beforeMissing = (Object.keys(plan.cost) as ResourceType[]).reduce((sum, res) => sum + Math.max(0, plan.cost[res] - resources[res]), 0);
+    const afterMissing = (Object.keys(plan.cost) as ResourceType[]).reduce((sum, res) => sum + Math.max(0, plan.cost[res] - next[res]), 0);
+    return score + Math.max(0, beforeMissing - afterMissing) * plan.weight;
+  }, 0);
 }
 
 // ═══════════════════════════════════════════════════════════
@@ -170,6 +224,9 @@ function App() {
   const [password, setPassword] = useState('');
   const [authError, setAuthError] = useState<string | null>(null);
   const [authLoading, setAuthLoading] = useState(false);
+  const [authRestoring, setAuthRestoring] = useState(() => !!localStorage.getItem('catan_token'));
+  const [pendingAction, setPendingAction] = useState<string | null>(null);
+  const [pendingEvent, setPendingEvent] = useState<string | null>(null);
 
   // Socket & game state
   const [socket, setSocket] = useState<Socket | null>(null);
@@ -193,7 +250,8 @@ function App() {
 
   // UI state
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
-  const [buildMode, setBuildMode] = useState<'settlement' | 'road' | 'city' | null>(null);
+  const [buildMode, setBuildMode] = useState<'settlement' | 'road' | 'ship' | 'moveShip' | 'city' | null>(null);
+  const [selectedShipEdge, setSelectedShipEdge] = useState<string | null>(null);
   const [showBankTrade, setShowBankTrade] = useState(false);
   const [showP2PTrade, setShowP2PTrade] = useState(false);
   const [showDevCards, setShowDevCards] = useState(false);
@@ -202,6 +260,10 @@ function App() {
   const [p2pOffer, setP2pOffer] = useState<Resources>(ZERO_RES());
   const [p2pRequest, setP2pRequest] = useState<Resources>(ZERO_RES());
   const [discardAmounts, setDiscardAmounts] = useState<Resources>(ZERO_RES());
+  const [showLogDrawer, setShowLogDrawer] = useState(false);
+  const [motionMode, setMotionMode] = useState<'fast' | 'cinematic'>(() =>
+    localStorage.getItem('catan_motion_mode') === 'cinematic' ? 'cinematic' : 'fast'
+  );
 
   // Dice animation
   const [showDiceAnim, setShowDiceAnim] = useState(false);
@@ -226,6 +288,8 @@ function App() {
   const flyIdRef = useRef(0);
   const rejoinTimeoutRef = useRef<number | null>(null);
   const currentGameIdRef = useRef<string | null>(null);
+  const pendingActionSeqRef = useRef(0);
+  const pendingEventRef = useRef<string | null>(null);
 
   // Dev Card / Steal event overlay
   const [devCardEvent, setDevCardEvent] = useState<GameEvent | null>(null);
@@ -336,23 +400,47 @@ function App() {
     setPlayerPresence({});
     setBotThinking(null);
     setBuildMode(null);
+    setSelectedShipEdge(null);
     setShowBankTrade(false);
     setShowP2PTrade(false);
     setShowDevCards(false);
     setPendingRobberHex(null);
     setStealTargets([]);
     setDevCardAction(null);
+    setPendingAction(null);
+    setPendingEvent(null);
+    pendingEventRef.current = null;
     prevPlayersRef.current = null;
     latestDiceResultRef.current = null;
   }, [clearStoredSession]);
 
   const emit = useCallback((event: string, payload: any = {}) => {
-    socket?.emit(event, { ...payload, gameId: currentGameId, userId, username: authUser?.username });
+    if (!socket) return;
+    if (pendingEventRef.current) return;
+    const actionLabel = ACTION_LABELS[event];
+    if (actionLabel) {
+      const seq = ++pendingActionSeqRef.current;
+      setPendingAction(actionLabel);
+      pendingEventRef.current = event;
+      setPendingEvent(event);
+      window.setTimeout(() => {
+        if (pendingActionSeqRef.current === seq) setPendingAction(null);
+        if (pendingEventRef.current === event) {
+          pendingEventRef.current = null;
+          setPendingEvent(null);
+        }
+      }, 2200);
+    }
+    socket.emit(event, { ...payload, gameId: currentGameId, userId, username: authUser?.username });
   }, [socket, currentGameId, userId, authUser]);
 
   useEffect(() => {
     currentGameIdRef.current = currentGameId;
   }, [currentGameId]);
+
+  useEffect(() => {
+    localStorage.setItem('catan_motion_mode', motionMode);
+  }, [motionMode]);
 
   // ── Check stored token on mount ──
   useEffect(() => {
@@ -361,12 +449,28 @@ function App() {
       fetch(`${API}/api/me`, { headers: { Authorization: `Bearer ${token}` } })
         .then(r => r.json())
         .then(data => {
-          if (data.id) { setAuthUser(data); setView('MATCHMAKING'); refreshMatchHistory(1, false); }
-          else { setIsRejoining(false); }
+          if (data.id) {
+            setAuthUser(data);
+            refreshMatchHistory(1, false);
+            const savedGameId = localStorage.getItem('catan_game_id');
+            const savedRoomCode = localStorage.getItem('catan_room_code');
+            if (savedGameId) {
+              setCurrentGameId(savedGameId);
+              if (savedRoomCode) setRoomCode(savedRoomCode);
+              setIsRejoining(true);
+              setView('GAME');
+            } else {
+              setView('MATCHMAKING');
+            }
+          } else {
+            setIsRejoining(false);
+          }
         })
-        .catch(() => { setIsRejoining(false); });
+        .catch(() => { setIsRejoining(false); })
+        .finally(() => setAuthRestoring(false));
     } else {
       setIsRejoining(false);
+      setAuthRestoring(false);
     }
   }, [refreshMatchHistory]);
 
@@ -438,6 +542,9 @@ function App() {
     s.on('game_joined', (data: { gameId: string; roomCode: string; status?: GameStatus; sessionToken?: string }) => {
       clearRejoinTimeout();
       setIsRejoining(false);
+      setPendingAction(null);
+      setPendingEvent(null);
+      pendingEventRef.current = null;
       setCurrentGameId(data.gameId);
       setRoomCode(data.roomCode);
       localStorage.setItem('catan_game_id', data.gameId);
@@ -469,6 +576,9 @@ function App() {
     });
     s.on('game_state', (st: GameState) => {
       setBotThinking(null); // Bot finished thinking
+      setPendingAction(null);
+      setPendingEvent(null);
+      pendingEventRef.current = null;
       setGameState(prev => {
         // Trigger dice animation if we just rolled
         if (st.diceResult && (!prev || !prev.diceResult) && st.diceResult !== prev?.diceResult) {
@@ -484,13 +594,15 @@ function App() {
         const flies: { id: number; pid: string; res: string; amount: number; isGain: boolean }[] = [];
         
         for (const pid of st.playerOrder) {
+          if (flies.length >= 8) break;
           const myRes = st.players[pid]?.resources;
           const oldRes = prevP[pid]?.resources;
           if (myRes && oldRes) {
             for (const r of ['wood','brick','sheep','wheat','ore'] as ResourceType[]) {
               const diff = myRes[r] - (oldRes[r] || 0);
               if (diff !== 0) {
-                flies.push({ id: flyIdRef.current++, pid, res: r, amount: Math.abs(diff), isGain: diff > 0 });
+                flies.push({ id: flyIdRef.current++, pid, res: r, amount: Math.min(Math.abs(diff), 2), isGain: diff > 0 });
+                if (flies.length >= 8) break;
               }
             }
           }
@@ -498,19 +610,19 @@ function App() {
         
         if (flies.length > 0) {
           // If a dice roll just happened, wait for the animation to finish (~2s)
-          const delay = (st.diceResult && (!prevP || !prevP[authUser.id]) && st.diceResult !== latestDiceResultRef.current) ? 2200 : 0;
+          const delay = motionMode === 'cinematic' && st.diceResult && (!prevP || !prevP[authUser.id]) && st.diceResult !== latestDiceResultRef.current ? 1200 : 0;
           
           setTimeout(() => {
             setGlobalFlies(f => [...f, ...flies]);
             setTimeout(() => {
               setGlobalFlies(f => f.filter(x => !flies.some(y => y.id === x.id)));
-            }, 3500);
+            }, motionMode === 'fast' ? 900 : 1800);
           }, delay);
         }
       }
       
       // Save deep copy of all players for accurate deltas
-      prevPlayersRef.current = JSON.parse(JSON.stringify(st.players));
+      prevPlayersRef.current = st.players;
       latestDiceResultRef.current = st.diceResult;
 
       if (st.status === 'IN_PROGRESS' || st.status === 'FINISHED') {
@@ -547,6 +659,9 @@ function App() {
     s.on('action_error', (msg: string) => { 
       clearRejoinTimeout();
       setIsRejoining(false);
+      setPendingAction(null);
+      setPendingEvent(null);
+      pendingEventRef.current = null;
       if (msg.toLowerCase().includes('not found')) {
         resetActiveSession();
         setView('MATCHMAKING');
@@ -558,7 +673,7 @@ function App() {
       clearRejoinTimeout();
       s.close();
     };
-  }, [authUser, clearStoredSession, refreshMatchHistory, refreshProfile, resetActiveSession]);
+  }, [authUser, clearStoredSession, motionMode, refreshMatchHistory, refreshProfile, resetActiveSession]);
 
   useEffect(() => {
     if (socket && isConnected && view === 'MATCHMAKING') {
@@ -575,6 +690,21 @@ function App() {
   const isMySetupTurn = isSetup && gs?.setupInfo?.currentPlayer === userId;
   const mustDiscard = gs?.playersWhoMustDiscard?.includes(userId) ?? false;
   const pIdx = (pid: string) => (gs?.playerOrder.indexOf(pid) ?? -1) + 1;
+  const myValidMoves = gs?.validMoves?.[userId] ?? { settlements: [], roads: [], ships: [], movableShips: [], cities: [], robberHexes: [] };
+  const isSeafarers = gs?.expansion === 'seafarers';
+  const pendingGoldCount = gs?.pendingGoldChoices?.[userId] ?? 0;
+  const isActionPending = Boolean(pendingEvent);
+  const tradeAdvisor = me ? (() => {
+    const offering = resourceTotal(p2pOffer);
+    const requesting = resourceTotal(p2pRequest);
+    if (offering === 0 || requesting === 0) return { tone: 'neutral', text: 'Build a trade by selecting resources on both sides.' };
+    const gain = scoreTrade(me.resources, p2pRequest, p2pOffer);
+    const rawBalance = requesting - offering;
+    if (gain >= 8 && rawBalance >= -1) return { tone: 'good', text: 'Strong trade: it completes or nearly completes an important build.' };
+    if (rawBalance < -1 && gain < 8) return { tone: 'bad', text: 'Risky trade: you give too much without a clear build payoff.' };
+    if (gain > 0) return { tone: 'neutral', text: 'Playable trade: it improves your next build path.' };
+    return { tone: 'bad', text: 'Weak trade: it does not clearly improve your current plan.' };
+  })() : { tone: 'neutral', text: '' };
 
   const totalVP = () => {
     if (!me || !gs) return 0;
@@ -586,17 +716,54 @@ function App() {
   };
 
   // ── Handlers ──
-  const handleVertexClick = (vid: string) => {
-    if (isSetup && isMySetupTurn && gs?.setupInfo?.expectedAction === 'settlement') { emit('place_settlement', { vertexId: vid }); return; }
-    if (buildMode === 'settlement') { emit('place_settlement', { vertexId: vid }); setBuildMode(null); }
-    else if (buildMode === 'city') { emit('upgrade_city', { vertexId: vid }); setBuildMode(null); }
-  };
-  const handleEdgeClick = (eid: string) => {
-    if (isSetup && isMySetupTurn && gs?.setupInfo?.expectedAction === 'road') { emit('place_road', { edgeId: eid }); return; }
-    if (buildMode === 'road' || (gs?.roadBuildingRemaining ?? 0) > 0) { emit('place_road', { edgeId: eid }); if (buildMode === 'road') setBuildMode(null); }
-  };
-  const handleHexClick = (hc: string) => {
-    if (gs?.turnPhase === 'ROBBER_MOVE' && isMyTurn) {
+  const handleVertexClick = useCallback((vid: string) => {
+    if (isActionPending) return;
+    if (isSetup && isMySetupTurn && gs?.setupInfo?.expectedAction === 'settlement') {
+      if (myValidMoves.settlements.includes(vid)) emit('place_settlement', { vertexId: vid });
+      return;
+    }
+    if (buildMode === 'settlement') {
+      if (myValidMoves.settlements.includes(vid)) { emit('place_settlement', { vertexId: vid }); setBuildMode(null); }
+    } else if (buildMode === 'city') {
+      if (myValidMoves.cities.includes(vid)) { emit('upgrade_city', { vertexId: vid }); setBuildMode(null); }
+    }
+  }, [buildMode, emit, gs, isActionPending, isMySetupTurn, isSetup, myValidMoves]);
+
+  const handleEdgeClick = useCallback((eid: string) => {
+    if (isActionPending) return;
+    if (isSetup && isMySetupTurn && gs?.setupInfo?.expectedAction === 'road') {
+      if (myValidMoves.ships.includes(eid)) emit('place_ship', { edgeId: eid });
+      else if (myValidMoves.roads.includes(eid)) emit('place_road', { edgeId: eid });
+      return;
+    }
+    if (buildMode === 'ship') {
+      if (myValidMoves.ships.includes(eid)) { emit('place_ship', { edgeId: eid }); setBuildMode(null); }
+      return;
+    }
+    if (buildMode === 'moveShip') {
+      if (!selectedShipEdge && myValidMoves.movableShips.includes(eid)) {
+        setSelectedShipEdge(eid);
+        return;
+      }
+      if (selectedShipEdge && myValidMoves.ships.includes(eid)) {
+        emit('move_ship', { fromEdgeId: selectedShipEdge, toEdgeId: eid });
+        setSelectedShipEdge(null);
+        setBuildMode(null);
+      }
+      return;
+    }
+    if (buildMode === 'road' || (gs?.roadBuildingRemaining ?? 0) > 0) {
+      if (myValidMoves.roads.includes(eid)) {
+        emit('place_road', { edgeId: eid });
+        if (buildMode === 'road') setBuildMode(null);
+      } else if ((gs?.roadBuildingRemaining ?? 0) > 0 && myValidMoves.ships.includes(eid)) {
+        emit('place_ship', { edgeId: eid });
+      }
+    }
+  }, [buildMode, emit, gs, isActionPending, isMySetupTurn, isSetup, myValidMoves, selectedShipEdge]);
+
+  const handleHexClick = useCallback((hc: string) => {
+    if (gs?.turnPhase === 'ROBBER_MOVE' && isMyTurn && !isActionPending && myValidMoves.robberHexes.includes(hc)) {
       // Find players with buildings on this hex to allow steal picker
       const hexQ = parseInt(hc.split(',')[0]);
       const hexR = parseInt(hc.split(',')[1]);
@@ -610,10 +777,19 @@ function App() {
         hexVerts.push(`${Math.round(cx + SIZE * Math.cos(a))},${Math.round(cy + SIZE * Math.sin(a))}`);
       }
       const targets = new Set<string>();
-      hexVerts.forEach(v => {
-        const bld = gs?.buildings[v];
-        if (bld && bld.owner !== userId) targets.add(bld.owner);
-      });
+      const targetHex = boardState.hexes.find(hex => `${hex.q},${hex.r}` === hc);
+      if (targetHex?.type === 'sea') {
+        for (let i = 0; i < 6; i++) {
+          const eid = [hexVerts[i], hexVerts[(i + 1) % 6]].sort().join(':');
+          const owner = gs?.ships?.[eid];
+          if (owner && owner !== userId) targets.add(owner);
+        }
+      } else {
+        hexVerts.forEach(v => {
+          const bld = gs?.buildings[v];
+          if (bld && bld.owner !== userId) targets.add(bld.owner);
+        });
+      }
       const targetList = Array.from(targets);
       
       if (targetList.length === 0) {
@@ -628,7 +804,7 @@ function App() {
         setStealTargets(targetList);
       }
     }
-  };
+  }, [boardState.hexes, emit, gs, isActionPending, isMyTurn, myValidMoves, userId]);
 
   const getBestBankRate = (offerRes: ResourceType) => {
     if (!gs) return 4;
@@ -660,6 +836,18 @@ function App() {
   // ═══════════════════════════════════════════════════════════
   //  AUTH VIEW
   // ═══════════════════════════════════════════════════════════
+
+  if (authRestoring) {
+    return (
+      <div className="game-container">
+        <motion.div className="glass-panel app-loading-card" initial={{ opacity: 0, y: 16 }} animate={{ opacity: 1, y: 0 }}>
+          <div className="golden-spinner"></div>
+          <h1>Restoring your session</h1>
+          <p>Checking your account and reconnecting to the latest table.</p>
+        </motion.div>
+      </div>
+    );
+  }
 
   if (view === 'AUTH' || !authUser) {
     return (
@@ -715,10 +903,14 @@ function App() {
               onClick={logout}>Logout</button>
           </div>
 
-          <button className="btn-action btn-lg" style={{ width: '100%', marginBottom: '1rem' }}
-            onClick={() => socket?.emit('create_lobby', { userId, username: authUser.username })}>
-            ➕ Create New Room
-          </button>
+          <div className="mode-create-grid">
+            <button className="btn-action btn-lg" onClick={() => socket?.emit('create_lobby', { userId, username: authUser.username, expansion: 'base' })}>
+              ➕ Classic Catan
+            </button>
+            <button className="btn-action btn-lg seafarers-create" onClick={() => socket?.emit('create_lobby', { userId, username: authUser.username, expansion: 'seafarers' })}>
+              ⛵ Seafarers
+            </button>
+          </div>
 
           {/* JOIN BY CODE */}
           <div style={{ display: 'flex', gap: '8px', marginBottom: '1.5rem' }}>
@@ -740,7 +932,9 @@ function App() {
             {lobbies.length === 0 && <p style={{ color: 'var(--text-dim)', fontSize: '0.85rem' }}>No rooms yet. Create one!</p>}
             {lobbies.map(l => (
               <div key={l.id} style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', background: 'rgba(0,0,0,0.25)', padding: '10px 14px', borderRadius: '10px', border: '1px solid rgba(255,255,255,0.05)' }}>
-                <span style={{ fontSize: '0.85rem' }}>🏰 {l.roomCode || l.id.substring(0, 8)}</span>
+                <span style={{ fontSize: '0.85rem' }}>
+                  {l.boardState?.expansion === 'seafarers' || l.gameState?.expansion === 'seafarers' ? '⛵' : '🏰'} {l.roomCode || l.id.substring(0, 8)}
+                </span>
                 <button className="btn-action" onClick={() => {
                   setCurrentGameId(l.id); setView('LOBBY');
                   socket?.emit('join_game', { gameId: l.id, userId, username: authUser.username });
@@ -800,6 +994,9 @@ function App() {
       <div className="lobby-screen" style={{ overflow: 'auto' }}>
         <motion.div className="glass-panel lobby-card" initial={{ opacity: 0, scale: 0.95 }} animate={{ opacity: 1, scale: 1 }}>
           <h1 style={{ fontSize: '1.6rem' }}>🏰 Game Lobby</h1>
+          <div className="lobby-expansion-chip">
+            {gs?.expansion === 'seafarers' ? '⛵ Seafarers: New Shores' : '🏰 Classic Catan'}
+          </div>
           
           {/* ROOM CODE - Big, prominent, copyable */}
           <div style={{ background: 'rgba(0,0,0,0.3)', borderRadius: '12px', padding: '12px 16px', marginBottom: '1rem', border: '1px solid var(--glass-border)' }}>
@@ -898,6 +1095,7 @@ function App() {
     if (gs.turnPhase === 'MUST_ROLL') return 'Roll to begin your turn';
     if (gs.turnPhase === 'ROBBER_DISCARD') return mustDiscard ? 'Discard half your hand' : 'Waiting for discards';
     if (gs.turnPhase === 'ROBBER_MOVE') return 'Move the robber';
+    if (gs.turnPhase === 'GOLD_CHOICE') return pendingGoldCount > 0 ? 'Choose gold field resources' : 'Waiting for gold choices';
     return 'Build, trade, or end turn';
   })();
 
@@ -909,6 +1107,7 @@ function App() {
     if (gs.turnPhase === 'MUST_ROLL') return 'Dice decide production. Rolling a 7 activates the robber.';
     if (gs.turnPhase === 'ROBBER_DISCARD') return mustDiscard ? 'Choose exactly the required number of cards.' : 'Other players must discard before robber movement.';
     if (gs.turnPhase === 'ROBBER_MOVE') return 'Choose a new hex, then steal from an adjacent opponent if possible.';
+    if (gs.turnPhase === 'GOLD_CHOICE') return pendingGoldCount > 0 ? `Choose ${pendingGoldCount} resource${pendingGoldCount > 1 ? 's' : ''} from your gold field production.` : 'Other players are choosing gold field resources.';
     return buildMode ? `Placement mode active: ${buildMode}. Click a valid board spot.` : 'Use the action deck below for your strongest move.';
   })();
 
@@ -930,6 +1129,7 @@ function App() {
       <AnimatePresence>
         {showDiceAnim && (
           <DiceAnimation d1={animDice.d1} d2={animDice.d2} total={animDice.total}
+            motionMode={motionMode}
             onComplete={() => setShowDiceAnim(false)} />
         )}
       </AnimatePresence>
@@ -943,7 +1143,14 @@ function App() {
         )}
       </AnimatePresence>
 
-
+      <AnimatePresence>
+        {pendingAction && (
+          <motion.div className="action-pending-pill" initial={{ y: -18, opacity: 0 }} animate={{ y: 0, opacity: 1 }} exit={{ y: -18, opacity: 0 }}>
+            <span className="pending-dot" />
+            {pendingAction}
+          </motion.div>
+        )}
+      </AnimatePresence>
 
       {/* DEV CARD / STEAL EVENT OVERLAY */}
       <AnimatePresence>
@@ -1092,7 +1299,7 @@ function App() {
             initial={{ opacity: 1, y: 0, x: 0, scale: 1.2 }}
             animate={{ opacity: 0, y: -80, scale: 0.6 }}
             exit={{ opacity: 0 }}
-            transition={{ duration: 1.8, ease: 'easeOut' }}
+            transition={{ duration: 1.05, ease: 'easeOut' }}
             style={{ 
               top: `${50 + i * 10}%`, 
               right: '320px', 
@@ -1229,7 +1436,7 @@ function App() {
                               ? { opacity: 1, y: 0, scale: 1, rotate: angle } 
                               : { opacity: 0, y: 60, scale: 0.5, rotate: angle + 30, filter: 'grayscale(100%)' }}
                             exit={{ opacity: 0, scale: 0.2 }}
-                            transition={{ type: 'spring', bounce: 0.4 }}
+                            transition={{ type: 'spring', bounce: 0.28, duration: 0.55 }}
                             style={{ 
                               position: isFirstCard ? 'relative' : 'absolute', 
                               left: isFirstCard ? 0 : `${offsetIndex * 15}px`, /* Fanning horizontal spread */
@@ -1251,6 +1458,10 @@ function App() {
           })}
         </div>
         <div className="topbar-right">
+          <button className="topbar-tool" onClick={() => setShowLogDrawer(true)}>Log</button>
+          <button className="topbar-tool" onClick={() => setMotionMode(mode => mode === 'fast' ? 'cinematic' : 'fast')}>
+            {motionMode === 'fast' ? 'Fast' : 'Cinematic'}
+          </button>
           <button className="btn-fullscreen" onClick={() => toggleFullscreen()}
             title="Toggle fullscreen (F)">⛶ {isFullscreen ? 'Exit' : 'Full'}</button>
           <div className={`live-pill ${isConnected ? 'connected' : 'disconnected'}`}>
@@ -1275,8 +1486,9 @@ function App() {
             ports={boardState.ports}
             gameState={gs} onVertexClick={handleVertexClick}
             onEdgeClick={handleEdgeClick} onHexClick={handleHexClick}
-            robberHex={gs?.robberHex ?? null} buildMode={buildMode}
+            robberHex={gs?.robberHex ?? null} pirateHex={gs?.pirateHex ?? null} buildMode={buildMode}
             setupHighlight={isMySetupTurn ? expectedAction ?? null : null}
+            validMoves={myValidMoves}
             currentPlayerColor={gs?.players[userId]?.color} />
         ) : <div style={{ color: 'var(--text-dim)' }}>Loading board...</div>}
 
@@ -1304,6 +1516,13 @@ function App() {
             ))}
           </div>
         )}
+
+        {gs?.phase === 'MAIN_GAME' && isMyTurn && gs.turnPhase === 'FREE_ACTION' && (
+          <button className="floating-end-turn" disabled={isActionPending} onClick={() => emit('end_turn')}>
+            <span>End Turn</span>
+            <small>pass to next player</small>
+          </button>
+        )}
       </div>
 
       {/* SIDEBAR */}
@@ -1320,12 +1539,12 @@ function App() {
             {currentPlayer && <span style={{ color: currentPlayer.color }}>{currentPlayer.username}</span>}
           </div>
           {gs?.phase === 'MAIN_GAME' && isMyTurn && gs.turnPhase === 'MUST_ROLL' && (
-            <button className="btn-action btn-lg command-primary" onClick={() => emit('roll_dice')}>
+            <button className="btn-action btn-lg command-primary" disabled={isActionPending} onClick={() => emit('roll_dice')}>
               🎲 Roll Dice
             </button>
           )}
           {gs?.phase === 'MAIN_GAME' && isMyTurn && gs.turnPhase === 'FREE_ACTION' && (
-            <button className="btn-action btn-lg command-primary end-turn" onClick={() => emit('end_turn')}>
+            <button className="btn-action btn-lg command-primary end-turn" disabled={isActionPending} onClick={() => emit('end_turn')}>
               End Turn
             </button>
           )}
@@ -1336,8 +1555,8 @@ function App() {
         {isSetup && (
           <div className={`phase-banner ${isMySetupTurn ? 'your-turn' : 'waiting'} ${botThinking ? 'pulsing' : ''}`}>
             {isMySetupTurn ? (
-              <><span style={{ fontSize: '1.2rem' }}>{expectedAction === 'settlement' ? '🏠' : '🛤️'}</span>
-              <span>Place your {expectedAction}</span></>
+              <><span style={{ fontSize: '1.2rem' }}>{expectedAction === 'settlement' ? '🏠' : isSeafarers ? '⛵' : '🛤️'}</span>
+              <span>Place your {expectedAction === 'road' && isSeafarers ? 'route' : expectedAction}</span></>
             ) : (
               <span>{botThinking ? '🤖 Bot is thinking...' : `⏳ P${pIdx(gs?.setupInfo?.currentPlayer ?? '')} is placing`}</span>
             )}
@@ -1400,6 +1619,21 @@ function App() {
           </div>
         )}
 
+        {pendingGoldCount > 0 && (
+          <div className="discard-panel gold-choice-panel">
+            <h4>🏝️ Choose {pendingGoldCount} gold field resource{pendingGoldCount > 1 ? 's' : ''}</h4>
+            <div className="gold-choice-grid">
+              {(['wood','brick','sheep','wheat','ore'] as ResourceType[]).map(resource => (
+                <button key={resource} className={`resource-card ${resource}`} disabled={isActionPending}
+                  onClick={() => emit('choose_gold_resource', { resource })}>
+                  <span className="rc-icon">{RES[resource]}</span>
+                  <span className="rc-name">{resource}</span>
+                </button>
+              ))}
+            </div>
+          </div>
+        )}
+
         {/* Build & Trade */}
         {gs?.phase === 'MAIN_GAME' && isMyTurn && gs.turnPhase === 'FREE_ACTION' && (
           <>
@@ -1407,23 +1641,42 @@ function App() {
               <h3>Build</h3>
               <div className="build-grid">
                 <button className={`build-btn ${buildMode === 'settlement' ? 'active' : ''}`}
+                  disabled={isActionPending || myValidMoves.settlements.length === 0}
                   onClick={() => setBuildMode(buildMode === 'settlement' ? null : 'settlement')}>
                   <span className="build-icon">🏠</span><span>Settlement</span><span className="build-cost">🪵🧱🐑🌾</span>
                 </button>
                 <button className={`build-btn ${buildMode === 'road' ? 'active' : ''}`}
+                  disabled={isActionPending || myValidMoves.roads.length === 0}
                   onClick={() => setBuildMode(buildMode === 'road' ? null : 'road')}>
                   <span className="build-icon">🛤️</span><span>Road</span><span className="build-cost">🪵🧱</span>
                 </button>
+                {isSeafarers && (
+                  <button className={`build-btn ${buildMode === 'ship' ? 'active' : ''}`}
+                    disabled={isActionPending || myValidMoves.ships.length === 0}
+                    onClick={() => { setSelectedShipEdge(null); setBuildMode(buildMode === 'ship' ? null : 'ship'); }}>
+                    <span className="build-icon">⛵</span><span>Ship</span><span className="build-cost">🪵🐑</span>
+                  </button>
+                )}
                 <button className={`build-btn ${buildMode === 'city' ? 'active' : ''}`}
+                  disabled={isActionPending || myValidMoves.cities.length === 0}
                   onClick={() => setBuildMode(buildMode === 'city' ? null : 'city')}>
                   <span className="build-icon">🏰</span><span>City</span><span className="build-cost">🌾🌾🪨🪨🪨</span>
                 </button>
-                <button className="build-btn" onClick={() => emit('buy_dev_card')}>
+                <button className="build-btn" disabled={isActionPending} onClick={() => emit('buy_dev_card')}>
                   <span className="build-icon">🃏</span><span>Dev Card</span><span className="build-cost">🐑🌾🪨</span>
                 </button>
+                {isSeafarers && (
+                  <button className={`build-btn ${buildMode === 'moveShip' ? 'active' : ''}`}
+                    disabled={isActionPending || myValidMoves.movableShips.length === 0}
+                    onClick={() => { setSelectedShipEdge(null); setBuildMode(buildMode === 'moveShip' ? null : 'moveShip'); }}>
+                    <span className="build-icon">🧭</span><span>Move Ship</span><span className="build-cost">1/turn</span>
+                  </button>
+                )}
               </div>
               {buildMode && <p style={{ fontSize: '0.75rem', color: 'var(--info)', textAlign: 'center', marginTop: '6px' }}>
-                ← Click the board to place your {buildMode}</p>}
+                {buildMode === 'moveShip'
+                  ? selectedShipEdge ? '← Pick the new valid sea route for that ship' : '← Pick an open end ship to move'
+                  : `← Click the board to place your ${buildMode}`}</p>}
             </div>
 
             <div className="sidebar-section">
@@ -1452,6 +1705,7 @@ function App() {
                       Rate: {getBestBankRate(bankOffer)}:1 {getBestBankRate(bankOffer) < 4 ? '✨' : ''}
                     </span>
                     <button className="btn-action" style={{ padding: '4px 16px' }}
+                    disabled={isActionPending}
                     onClick={() => { emit('bank_trade', { offer: bankOffer, request: bankRequest }); setShowBankTrade(false); setBankOffer('wood'); setBankRequest('ore'); }}>Trade</button>
                   </div>
                 </div>
@@ -1498,7 +1752,12 @@ function App() {
                       ))}
                     </div>
                   </div>
+                  <div className={`trade-advisor ${tradeAdvisor.tone}`}>
+                    <strong>Advisor</strong>
+                    <span>{tradeAdvisor.text}</span>
+                  </div>
                   <button className="btn-action" style={{ width: '100%', marginTop: '6px' }}
+                    disabled={isActionPending || resourceTotal(p2pOffer) === 0 || resourceTotal(p2pRequest) === 0}
                     onClick={() => { emit('propose_trade', { offering: p2pOffer, requesting: p2pRequest }); setShowP2PTrade(false); setP2pOffer(ZERO_RES()); setP2pRequest(ZERO_RES()); }}>
                     Propose Trade</button>
                 </div>
@@ -1640,13 +1899,13 @@ function App() {
                     {gs.activeTradeOffer.fromPlayer !== userId ? (
                       <>
                         <button className="btn-action btn-lg" style={{ flex: 2, background: 'var(--success)' }}
-                          onClick={() => emit('accept_trade')}>✅ Accept Trade</button>
+                          disabled={isActionPending} onClick={() => emit('accept_trade')}>✅ Accept Trade</button>
                         <button className="btn-action btn-ghost" style={{ flex: 1 }}
-                          onClick={() => emit('reject_trade')}>Dismiss</button>
+                          disabled={isActionPending} onClick={() => emit('reject_trade')}>Dismiss</button>
                       </>
                     ) : (
                       <button className="btn-action btn-ghost" style={{ width: '100%', border: '1px dashed var(--danger)', color: 'var(--danger)' }}
-                        onClick={() => emit('reject_trade')}>❌ Cancel My Offer</button>
+                        disabled={isActionPending} onClick={() => emit('reject_trade')}>❌ Cancel My Offer</button>
                     )}
                   </div>
                 </div>
@@ -1686,6 +1945,32 @@ function App() {
                 Enter anyway
               </button>
             </div>
+          </motion.div>
+        )}
+      </AnimatePresence>
+
+      <AnimatePresence>
+        {showLogDrawer && (
+          <motion.div className="log-drawer-backdrop" initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }}
+            onClick={() => setShowLogDrawer(false)}>
+            <motion.div className="log-drawer" initial={{ x: 340 }} animate={{ x: 0 }} exit={{ x: 340 }}
+              onClick={(event) => event.stopPropagation()}>
+              <div className="log-drawer-header">
+                <div>
+                  <span>Island Log</span>
+                  <small>{gs?.log?.length ?? 0} recorded actions</small>
+                </div>
+                <button onClick={() => setShowLogDrawer(false)}>Close</button>
+              </div>
+              <div className="log-drawer-list">
+                {(gs?.log ?? []).slice().reverse().map((msg, index) => (
+                  <div key={`${msg}-${index}`} className="log-drawer-entry">
+                    <span>{renderTimelineIcon(msg)}</span>
+                    <p>{msg}</p>
+                  </div>
+                ))}
+              </div>
+            </motion.div>
           </motion.div>
         )}
       </AnimatePresence>

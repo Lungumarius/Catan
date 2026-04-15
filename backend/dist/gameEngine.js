@@ -9,6 +9,7 @@ const BUILD_COSTS = {
     settlement: { wood: 1, brick: 1, sheep: 1, wheat: 1, ore: 0 },
     city: { wood: 0, brick: 0, sheep: 0, wheat: 2, ore: 3 },
     road: { wood: 1, brick: 1, sheep: 0, wheat: 0, ore: 0 },
+    ship: { wood: 1, brick: 0, sheep: 1, wheat: 0, ore: 0 },
     devCard: { wood: 0, brick: 0, sheep: 1, wheat: 1, ore: 1 },
 };
 const INITIAL_DEV_DECK = [
@@ -19,7 +20,7 @@ const INITIAL_DEV_DECK = [
     ...Array(2).fill('roadBuilding'),
 ];
 const RESOURCE_FROM_HEX = {
-    forest: 'wood', hill: 'brick', pasture: 'sheep', field: 'wheat', mountain: 'ore', desert: null,
+    forest: 'wood', hill: 'brick', pasture: 'sheep', field: 'wheat', mountain: 'ore', desert: null, sea: null, gold: null,
 };
 // ═══════════════════════════════════════════════════════════
 //  GEOMETRY — Shared between Server & Frontend
@@ -56,6 +57,7 @@ function shuffle(arr) {
 //  GAME ENGINE
 // ═══════════════════════════════════════════════════════════
 class GameEngine {
+    expansion = 'base';
     // Phase tracking
     phase = 'SETUP_R1';
     turnPhase = 'FREE_ACTION'; // Setup doesn't need dice roll
@@ -73,9 +75,13 @@ class GameEngine {
     // Board pieces
     buildings = {}; // vertexId → Building
     roads = {}; // edgeId → userId
+    ships = {}; // edgeId → userId
+    shipBuiltOnTurn = {};
     // Robber
     robberHex = '0,0'; // q,r of hex with robber (starts on desert)
+    pirateHex = null; // Seafarers sea robber
     playersWhoMustDiscard = [];
+    pendingGoldChoices = {};
     // Development cards
     devCardDeck = [];
     // Longest Road & Largest Army tracking
@@ -98,6 +104,8 @@ class GameEngine {
     winner = null;
     // Road building dev card state
     roadBuildingRemaining = 0;
+    movedShipThisTurn = false;
+    turnNumber = 1;
     // Domain metadata
     startedAt = null;
     finishedAt = null;
@@ -113,6 +121,7 @@ class GameEngine {
     setBoard(board, ports = []) {
         this.board = board;
         this.ports = ports;
+        this.expansion = board.some(hex => hex.type === 'sea' || hex.type === 'gold') ? 'seafarers' : 'base';
         // Build adjacency map + count how many hexes each vertex touches
         this.adjacencyMap = {};
         const vertexHexCount = {};
@@ -146,6 +155,8 @@ class GameEngine {
         const desert = board.find(h => h.type === 'desert');
         if (desert)
             this.robberHex = `${desert.q},${desert.r}`;
+        const firstSea = board.find(h => h.type === 'sea');
+        this.pirateHex = this.expansion === 'seafarers' && firstSea ? `${firstSea.q},${firstSea.r}` : null;
         // Init dev deck
         this.devCardDeck = shuffle([...INITIAL_DEV_DECK]);
     }
@@ -192,6 +203,7 @@ class GameEngine {
         const raw = state?.snapshotVersion ? state : {
             snapshotVersion: 1,
             ...state,
+            expansion: state?.expansion ?? this.expansion,
             devCardDeck: Array.isArray(state?.devCardDeck) ? state.devCardDeck : [],
             lastDiceYields: state?.lastDiceYields || {},
             setupSettlements: Array.isArray(state?.setupSettlements) ? state.setupSettlements : [],
@@ -210,6 +222,7 @@ class GameEngine {
         ]));
         return {
             snapshotVersion: GAME_SNAPSHOT_VERSION,
+            expansion: raw.expansion === 'seafarers' ? 'seafarers' : this.expansion,
             phase: raw.phase ?? 'SETUP_R1',
             turnPhase: raw.turnPhase ?? 'FREE_ACTION',
             setupTurnIndex: typeof raw.setupTurnIndex === 'number' ? raw.setupTurnIndex : 0,
@@ -223,8 +236,12 @@ class GameEngine {
             lastDiceYields: typeof raw.lastDiceYields === 'object' && raw.lastDiceYields ? raw.lastDiceYields : {},
             buildings: typeof raw.buildings === 'object' && raw.buildings ? raw.buildings : {},
             roads: typeof raw.roads === 'object' && raw.roads ? raw.roads : {},
+            ships: typeof raw.ships === 'object' && raw.ships ? raw.ships : {},
+            shipBuiltOnTurn: typeof raw.shipBuiltOnTurn === 'object' && raw.shipBuiltOnTurn ? raw.shipBuiltOnTurn : {},
             robberHex: typeof raw.robberHex === 'string' ? raw.robberHex : this.robberHex,
+            pirateHex: typeof raw.pirateHex === 'string' ? raw.pirateHex : this.pirateHex,
             playersWhoMustDiscard: Array.isArray(raw.playersWhoMustDiscard) ? raw.playersWhoMustDiscard.filter((playerId) => typeof playerId === 'string') : [],
+            pendingGoldChoices: typeof raw.pendingGoldChoices === 'object' && raw.pendingGoldChoices ? raw.pendingGoldChoices : {},
             devCardDeck: Array.isArray(raw.devCardDeck) ? raw.devCardDeck.filter((card) => typeof card === 'string') : [],
             longestRoadHolder: typeof raw.longestRoadHolder === 'string' ? raw.longestRoadHolder : null,
             longestRoadLength: typeof raw.longestRoadLength === 'number' ? raw.longestRoadLength : 0,
@@ -241,6 +258,8 @@ class GameEngine {
             log: Array.isArray(raw.log) ? raw.log.filter((line) => typeof line === 'string').slice(-100) : [],
             winner: typeof raw.winner === 'string' ? raw.winner : null,
             roadBuildingRemaining: typeof raw.roadBuildingRemaining === 'number' ? raw.roadBuildingRemaining : 0,
+            movedShipThisTurn: Boolean(raw.movedShipThisTurn),
+            turnNumber: typeof raw.turnNumber === 'number' ? raw.turnNumber : 1,
             lastEvent: raw.lastEvent && typeof raw.lastEvent === 'object' ? raw.lastEvent : null,
             setupSettlements: Array.isArray(raw.setupSettlements)
                 ? raw.setupSettlements.filter((item) => typeof item?.playerId === 'string' && typeof item?.vertexId === 'string')
@@ -254,6 +273,7 @@ class GameEngine {
     }
     setState(state) {
         const snapshot = this.normalizeSnapshot(state);
+        this.expansion = snapshot.expansion;
         this.phase = snapshot.phase;
         this.turnPhase = snapshot.turnPhase;
         this.setupTurnIndex = snapshot.setupTurnIndex;
@@ -267,8 +287,12 @@ class GameEngine {
         this.lastDiceYields = snapshot.lastDiceYields;
         this.buildings = snapshot.buildings;
         this.roads = snapshot.roads;
+        this.ships = snapshot.ships;
+        this.shipBuiltOnTurn = snapshot.shipBuiltOnTurn;
         this.robberHex = snapshot.robberHex;
+        this.pirateHex = snapshot.pirateHex;
         this.playersWhoMustDiscard = snapshot.playersWhoMustDiscard;
+        this.pendingGoldChoices = snapshot.pendingGoldChoices;
         this.devCardDeck = snapshot.devCardDeck.length > 0 ? snapshot.devCardDeck : shuffle([...INITIAL_DEV_DECK]);
         this.longestRoadHolder = snapshot.longestRoadHolder;
         this.longestRoadLength = snapshot.longestRoadLength;
@@ -278,6 +302,8 @@ class GameEngine {
         this.log = snapshot.log;
         this.winner = snapshot.winner;
         this.roadBuildingRemaining = snapshot.roadBuildingRemaining;
+        this.movedShipThisTurn = snapshot.movedShipThisTurn;
+        this.turnNumber = snapshot.turnNumber;
         this.lastEvent = snapshot.lastEvent;
         this.setupSettlements = snapshot.setupSettlements;
         this.startedAt = snapshot.startedAt;
@@ -287,6 +313,86 @@ class GameEngine {
     isBlockedByOpponent(vertexId, userId) {
         const building = this.buildings[vertexId];
         return Boolean(building && building.owner !== userId);
+    }
+    getAllEdges() {
+        const edges = new Set();
+        this.board.forEach(hex => {
+            const { x, y } = getPixelPos(hex.q, hex.r);
+            const vertices = getVerticesForHex(x, y);
+            for (let index = 0; index < vertices.length; index++) {
+                edges.add([vertices[index], vertices[(index + 1) % vertices.length]].sort().join(':'));
+            }
+        });
+        return Array.from(edges);
+    }
+    getHexesForEdge(edgeId) {
+        const [a, b] = edgeId.split(':');
+        return this.board.filter(hex => {
+            const { x, y } = getPixelPos(hex.q, hex.r);
+            const vertices = getVerticesForHex(x, y);
+            return vertices.some((vertex, index) => {
+                const next = vertices[(index + 1) % vertices.length];
+                return [vertex, next].sort().join(':') === [a, b].sort().join(':');
+            });
+        });
+    }
+    isSeaHex(hex) {
+        return hex?.type === 'sea';
+    }
+    isLandHex(hex) {
+        return Boolean(hex && hex.type !== 'sea');
+    }
+    isShipEdge(edgeId) {
+        const adjacentHexes = this.getHexesForEdge(edgeId);
+        const hasSea = adjacentHexes.some(hex => this.isSeaHex(hex));
+        const hasLand = adjacentHexes.some(hex => this.isLandHex(hex));
+        return hasSea && (!hasLand || adjacentHexes.length <= 2);
+    }
+    isLandRoadEdge(edgeId) {
+        const adjacentHexes = this.getHexesForEdge(edgeId);
+        return adjacentHexes.length > 0 && adjacentHexes.some(hex => this.isLandHex(hex));
+    }
+    isEdgeAdjacentToHex(edgeId, hexCoord) {
+        if (!hexCoord)
+            return false;
+        return this.getHexesForEdge(edgeId).some(hex => `${hex.q},${hex.r}` === hexCoord);
+    }
+    hasShipConnection(userId, edgeId) {
+        const [vA, vB] = edgeId.split(':');
+        const hasConnectingBuilding = this.buildings[vA]?.owner === userId || this.buildings[vB]?.owner === userId;
+        const hasConnectingShip = Object.entries(this.ships).some(([id, ownerId]) => {
+            if (ownerId !== userId)
+                return false;
+            const [oA, oB] = id.split(':');
+            const touchesA = (oA === vA || oB === vA) && !this.isBlockedByOpponent(vA, userId);
+            const touchesB = (oA === vB || oB === vB) && !this.isBlockedByOpponent(vB, userId);
+            return touchesA || touchesB;
+        });
+        return hasConnectingBuilding || hasConnectingShip;
+    }
+    validateShipDestination(userId, edgeId) {
+        if (this.ships[edgeId])
+            return 'Ship already built here';
+        if (this.roads[edgeId])
+            return 'A road already occupies this coastline';
+        if (!this.isShipEdge(edgeId))
+            return 'Ships must be built on sea or coastline routes';
+        if (this.isEdgeAdjacentToHex(edgeId, this.pirateHex))
+            return 'Cannot build next to the pirate';
+        if (!this.hasShipConnection(userId, edgeId))
+            return 'Ship must connect to your coastal settlement or shipping route';
+        return null;
+    }
+    isMovableShip(userId, edgeId) {
+        if (this.isEdgeAdjacentToHex(edgeId, this.pirateHex))
+            return false;
+        const [vA, vB] = edgeId.split(':');
+        const isOpenEndpoint = (vertexId) => {
+            const ownBuilding = this.buildings[vertexId]?.owner === userId;
+            const ownShipCount = Object.entries(this.ships).filter(([id, owner]) => owner === userId && id !== edgeId && id.split(':').includes(vertexId)).length;
+            return !ownBuilding && ownShipCount === 0;
+        };
+        return isOpenEndpoint(vA) || isOpenEndpoint(vB);
     }
     addPlayer(userId, username = '', isBot = false) {
         if (this.players[userId])
@@ -335,23 +441,25 @@ class GameEngine {
         const currentPlayer = this.getSetupCurrentPlayer();
         const settlementsInThisRound = Object.values(this.buildings)
             .filter(b => b.owner === currentPlayer && b.type === 'settlement').length;
-        const roadsInThisRound = Object.values(this.roads)
-            .filter(owner => owner === currentPlayer).length;
+        const routesInThisRound = Object.values(this.roads)
+            .filter(owner => owner === currentPlayer).length
+            + Object.values(this.ships).filter(owner => owner === currentPlayer).length;
         if (this.phase === 'SETUP_R1') {
-            return settlementsInThisRound < 1 ? 'settlement' : (roadsInThisRound < 1 ? 'road' : 'settlement');
+            return settlementsInThisRound < 1 ? 'settlement' : (routesInThisRound < 1 ? 'road' : 'settlement');
         }
         // SETUP_R2
-        return settlementsInThisRound < 2 ? 'settlement' : (roadsInThisRound < 2 ? 'road' : 'settlement');
+        return settlementsInThisRound < 2 ? 'settlement' : (routesInThisRound < 2 ? 'road' : 'settlement');
     }
     advanceSetup() {
         const currentPlayer = this.getSetupCurrentPlayer();
         const settlements = Object.values(this.buildings)
             .filter(b => b.owner === currentPlayer && b.type === 'settlement').length;
-        const playerRoads = Object.values(this.roads)
-            .filter(owner => owner === currentPlayer).length;
+        const playerRoutes = Object.values(this.roads)
+            .filter(owner => owner === currentPlayer).length
+            + Object.values(this.ships).filter(owner => owner === currentPlayer).length;
         const expectedSettlements = this.phase === 'SETUP_R1' ? 1 : 2;
         const expectedRoads = this.phase === 'SETUP_R1' ? 1 : 2;
-        if (settlements >= expectedSettlements && playerRoads >= expectedRoads) {
+        if (settlements >= expectedSettlements && playerRoutes >= expectedRoads) {
             this.setupTurnIndex++;
             if (this.setupTurnIndex >= this.playerOrder.length) {
                 if (this.phase === 'SETUP_R1') {
@@ -445,8 +553,13 @@ class GameEngine {
                 return false;
             return edgeId.split(':').includes(vertexId);
         });
-        if (!hasConnectingRoad)
-            return 'Must be connected to your road network';
+        const hasConnectingShip = Object.entries(this.ships).some(([edgeId, ownerId]) => {
+            if (ownerId !== userId)
+                return false;
+            return edgeId.split(':').includes(vertexId);
+        });
+        if (!hasConnectingRoad && !hasConnectingShip)
+            return 'Must be connected to your road or shipping network';
         // Cost check
         const cost = BUILD_COSTS.settlement;
         if (!this.canAfford(p, cost))
@@ -469,6 +582,10 @@ class GameEngine {
             return 'Player not found';
         if (this.roads[edgeId])
             return 'Road already built here';
+        if (this.ships[edgeId])
+            return 'A ship already occupies this route';
+        if (!this.isLandRoadEdge(edgeId))
+            return 'Roads must be built on land or coastline routes';
         const [vA, vB] = edgeId.split(':');
         // Connection check: Must touch your settlement or your road
         const hasConnectingBuilding = this.buildings[vA]?.owner === userId || this.buildings[vB]?.owner === userId;
@@ -533,6 +650,99 @@ class GameEngine {
         this.checkVictory(userId);
         return null;
     }
+    placeShip(userId, edgeId) {
+        if (this.expansion !== 'seafarers')
+            return 'Ships are only available in Seafarers';
+        const p = this.players[userId];
+        if (!p)
+            return 'Player not found';
+        if (this.ships[edgeId])
+            return 'Ship already built here';
+        if (this.roads[edgeId])
+            return 'A road already occupies this coastline';
+        const destinationError = this.validateShipDestination(userId, edgeId);
+        if (destinationError)
+            return destinationError;
+        const [vA, vB] = edgeId.split(':');
+        if (this.phase === 'SETUP_R1' || this.phase === 'SETUP_R2') {
+            if (this.getSetupCurrentPlayer() !== userId)
+                return 'Not your turn in setup';
+            if (this.getSetupExpectedAction() !== 'road')
+                return 'Must place a settlement first';
+            const playerPlacements = this.setupSettlements.filter(s => s.playerId === userId);
+            const lastSettlement = playerPlacements[playerPlacements.length - 1].vertexId;
+            if (vA !== lastSettlement && vB !== lastSettlement)
+                return 'In setup, ship must connect to the settlement you just placed';
+            this.ships[edgeId] = userId;
+            this.shipBuiltOnTurn[edgeId] = this.turnNumber;
+            this.recordAction('setup_ship_placed', userId, { edgeId });
+            this.addLog(`${this.playerName(userId)} placed a starting ship`);
+            this.advanceSetup();
+            return null;
+        }
+        if (this.phase !== 'MAIN_GAME')
+            return 'Cannot build right now';
+        if (this.playerOrder[this.currentTurnIndex] !== userId)
+            return 'Not your turn';
+        if (this.roadBuildingRemaining > 0) {
+            this.ships[edgeId] = userId;
+            this.shipBuiltOnTurn[edgeId] = this.turnNumber;
+            this.roadBuildingRemaining--;
+            this.recordAction('ship_built_free', userId, { edgeId, remaining: this.roadBuildingRemaining });
+            this.addLog(`${this.playerName(userId)} built a free ship (Road Building)`);
+            this.recalcLongestRoad();
+            this.checkVictory(userId);
+            return null;
+        }
+        if (this.turnPhase !== 'FREE_ACTION')
+            return 'Roll dice first';
+        const shipCount = Object.values(this.ships).filter(v => v === userId).length;
+        if (shipCount >= 15)
+            return 'Max ships reached (15)';
+        const cost = BUILD_COSTS.ship;
+        if (!this.canAfford(p, cost))
+            return 'Not enough resources (need: 🪵🐑)';
+        this.deductResources(p, cost);
+        this.ships[edgeId] = userId;
+        this.shipBuiltOnTurn[edgeId] = this.turnNumber;
+        this.recordAction('ship_built', userId, { edgeId });
+        this.addLog(`${this.playerName(userId)} built a ship`);
+        this.recalcLongestRoad();
+        this.checkVictory(userId);
+        return null;
+    }
+    moveShip(userId, fromEdgeId, toEdgeId) {
+        if (this.expansion !== 'seafarers')
+            return 'Ships are only available in Seafarers';
+        if (this.phase !== 'MAIN_GAME')
+            return 'Cannot move ships right now';
+        if (this.turnPhase !== 'FREE_ACTION')
+            return 'Roll dice first';
+        if (this.playerOrder[this.currentTurnIndex] !== userId)
+            return 'Not your turn';
+        if (this.movedShipThisTurn)
+            return 'You may only move 1 ship per turn';
+        if (this.ships[fromEdgeId] !== userId)
+            return 'Not your ship';
+        if (this.shipBuiltOnTurn[fromEdgeId] === this.turnNumber)
+            return 'Cannot move a ship built this turn';
+        if (!this.isMovableShip(userId, fromEdgeId))
+            return 'Only end ships in an open shipping route may move';
+        delete this.ships[fromEdgeId];
+        delete this.shipBuiltOnTurn[fromEdgeId];
+        const err = this.validateShipDestination(userId, toEdgeId);
+        if (err) {
+            this.ships[fromEdgeId] = userId;
+            this.shipBuiltOnTurn[fromEdgeId] = this.turnNumber - 1;
+            return err;
+        }
+        this.ships[toEdgeId] = userId;
+        this.movedShipThisTurn = true;
+        this.shipBuiltOnTurn[toEdgeId] = this.turnNumber - 1;
+        this.recordAction('ship_moved', userId, { fromEdgeId, toEdgeId });
+        this.addLog(`${this.playerName(userId)} moved a ship`);
+        return null;
+    }
     // ─────────────────────────────────────────
     //  UPGRADE TO CITY
     // ─────────────────────────────────────────
@@ -576,6 +786,7 @@ class GameEngine {
         this.dice1 = Math.floor(Math.random() * 6) + 1;
         this.dice2 = Math.floor(Math.random() * 6) + 1;
         this.diceResult = this.dice1 + this.dice2;
+        this.pendingGoldChoices = {};
         this.recordAction('dice_rolled', userId, { dice1: this.dice1, dice2: this.dice2, total: this.diceResult });
         this.addLog(`${this.playerName(userId)} rolled ${this.dice1} + ${this.dice2} = ${this.diceResult}`);
         if (this.diceResult === 7) {
@@ -599,7 +810,7 @@ class GameEngine {
         }
         // Distribute resources
         this.distributeResources(this.diceResult);
-        this.turnPhase = 'FREE_ACTION';
+        this.turnPhase = Object.values(this.pendingGoldChoices).some(amount => amount > 0) ? 'GOLD_CHOICE' : 'FREE_ACTION';
         return null;
     }
     // ─────────────────────────────────────────
@@ -617,7 +828,7 @@ class GameEngine {
             if (`${hex.q},${hex.r}` === this.robberHex)
                 return;
             const res = RESOURCE_FROM_HEX[hex.type];
-            if (!res)
+            if (!res && hex.type !== 'gold')
                 return;
             const { x, y } = getPixelPos(hex.q, hex.r);
             const verts = getVerticesForHex(x, y);
@@ -625,13 +836,37 @@ class GameEngine {
                 const building = this.buildings[vid];
                 if (building && this.players[building.owner]) {
                     const amount = building.type === 'city' ? 2 : 1;
-                    this.players[building.owner].resources[res] += amount;
-                    for (let i = 0; i < amount; i++) {
-                        this.lastDiceYields[building.owner].push(res);
+                    if (hex.type === 'gold') {
+                        this.pendingGoldChoices[building.owner] = (this.pendingGoldChoices[building.owner] || 0) + amount;
+                        this.addLog(`${this.playerName(building.owner)} must choose ${amount} gold field resource${amount > 1 ? 's' : ''}`);
+                    }
+                    else if (res) {
+                        this.players[building.owner].resources[res] += amount;
+                        for (let i = 0; i < amount; i++) {
+                            this.lastDiceYields[building.owner].push(res);
+                        }
                     }
                 }
             });
         });
+    }
+    chooseGoldResource(userId, resource) {
+        if (this.turnPhase !== 'GOLD_CHOICE')
+            return 'No gold field choice pending';
+        if ((this.pendingGoldChoices[userId] || 0) <= 0)
+            return 'You have no gold field resources to choose';
+        this.players[userId].resources[resource] += 1;
+        this.lastDiceYields[userId] = this.lastDiceYields[userId] || [];
+        this.lastDiceYields[userId].push(resource);
+        this.pendingGoldChoices[userId] -= 1;
+        if (this.pendingGoldChoices[userId] <= 0)
+            delete this.pendingGoldChoices[userId];
+        this.recordAction('gold_resource_chosen', userId, { resource });
+        this.addLog(`${this.playerName(userId)} chose 1 ${resource} from a gold field`);
+        if (!Object.values(this.pendingGoldChoices).some(amount => amount > 0)) {
+            this.turnPhase = 'FREE_ACTION';
+        }
+        return null;
     }
     // ─────────────────────────────────────────
     //  ROBBER
@@ -675,13 +910,47 @@ class GameEngine {
             return 'Not in robber move phase';
         if (this.playerOrder[this.currentTurnIndex] !== userId)
             return 'Not your turn';
-        if (hexCoord === this.robberHex)
-            return 'Must move robber to a different hex';
         // Validate hex exists
         const [q, r] = hexCoord.split(',').map(Number);
         const targetHex = this.board.find(h => h.q === q && h.r === r);
         if (!targetHex)
             return 'Invalid hex';
+        if (targetHex.type === 'sea') {
+            if (this.expansion !== 'seafarers')
+                return 'Pirate is only available in Seafarers';
+            if (hexCoord === this.pirateHex)
+                return 'Must move pirate to a different sea hex';
+            this.pirateHex = hexCoord;
+            this.recordAction('pirate_moved', userId, { hexCoord, stealFromPlayer });
+            this.addLog(`${this.playerName(userId)} moved the pirate`);
+            if (stealFromPlayer && stealFromPlayer !== userId) {
+                const victim = this.players[stealFromPlayer];
+                const adjacentShip = Object.entries(this.ships).some(([edgeId, owner]) => owner === stealFromPlayer && this.isEdgeAdjacentToHex(edgeId, hexCoord));
+                if (victim && adjacentShip && this.totalResources(victim) > 0) {
+                    const stolenRes = this.stealRandomResource(victim);
+                    if (stolenRes) {
+                        this.players[userId].resources[stolenRes] += 1;
+                        const vp = this.players[userId];
+                        this.addLog(`${this.playerName(userId)} stole 1 card with the pirate from ${this.playerName(stealFromPlayer)}`);
+                        this.recordAction('pirate_resource_stolen', userId, { from: stealFromPlayer, resource: stolenRes, hexCoord });
+                        this.lastEvent = {
+                            type: 'steal', eventId: this._mkEventId(),
+                            playerId: userId, playerName: this.playerName(userId), playerColor: vp.color,
+                            details: {
+                                stolenFrom: stealFromPlayer,
+                                stolenFromName: this.playerName(stealFromPlayer),
+                                stolenFromColor: victim.color,
+                                stolenRes,
+                            }
+                        };
+                    }
+                }
+            }
+            this.turnPhase = 'FREE_ACTION';
+            return null;
+        }
+        if (hexCoord === this.robberHex)
+            return 'Must move robber to a different hex';
         this.robberHex = hexCoord;
         this.recordAction('robber_moved', userId, { hexCoord, stealFromPlayer });
         this.addLog(`${this.playerName(userId)} moved the robber`);
@@ -720,6 +989,16 @@ class GameEngine {
     // Returns player IDs (excluding excludePlayer) who have buildings on hex
     getPlayersOnHex(hexCoord, excludePlayer) {
         const [q, r] = hexCoord.split(',').map(Number);
+        const targetHex = this.board.find(hex => hex.q === q && hex.r === r);
+        if (targetHex?.type === 'sea') {
+            const players = new Set();
+            Object.entries(this.ships).forEach(([edgeId, owner]) => {
+                if (owner !== excludePlayer && this.isEdgeAdjacentToHex(edgeId, hexCoord) && this.totalResources(this.players[owner]) > 0) {
+                    players.add(owner);
+                }
+            });
+            return Array.from(players);
+        }
         const { x, y } = getPixelPos(q, r);
         const verts = getVerticesForHex(x, y);
         const players = new Set();
@@ -755,10 +1034,14 @@ class GameEngine {
             return 'Must roll dice before ending turn';
         if (this.turnPhase === 'ROBBER_DISCARD' || this.turnPhase === 'ROBBER_MOVE')
             return 'Must resolve robber first';
+        if (this.turnPhase === 'GOLD_CHOICE')
+            return 'Gold field resources must be chosen first';
         this.currentTurnIndex = (this.currentTurnIndex + 1) % this.playerOrder.length;
+        this.turnNumber++;
         this.diceResult = null;
         this.turnPhase = 'MUST_ROLL';
         this.roadBuildingRemaining = 0;
+        this.movedShipThisTurn = false;
         // Reset dev card played flag
         const nextPlayer = this.players[this.playerOrder[this.currentTurnIndex]];
         if (nextPlayer)
@@ -1010,34 +1293,114 @@ class GameEngine {
             return false;
         const offer = this.activeTradeOffer;
         const bot = this.players[botId];
-        // Can bot fulfill? (has what proposer wants?)
+        const proposer = this.players[offer.fromPlayer];
         for (const [res, amount] of Object.entries(offer.requesting)) {
             if ((amount ?? 0) > 0 && bot.resources[res] < (amount ?? 0))
                 return false;
         }
-        // Value function: how much does the bot need this resource?
-        const valueForBot = (res, amount) => {
-            const r = res;
-            const p = bot;
-            const total = this.totalResources(p);
-            const have = p.resources[r];
-            const scarcity = total > 0 ? Math.max(0, 1 - (have / Math.max(1, total))) : 1;
-            const cityScore = (r === 'wheat' || r === 'ore') ? 2.5 : 0;
-            const settlScore = (r === 'wood' || r === 'brick' || r === 'sheep' || r === 'wheat') ? 1.5 : 0;
-            const devScore = (r === 'sheep' || r === 'wheat' || r === 'ore') ? 1.5 : 0;
-            return amount * (cityScore + settlScore + devScore) * (1 + scarcity);
-        };
-        let getScore = 0, giveScore = 0;
+        const totalOffered = Object.values(offer.offering).reduce((sum, amount) => sum + (amount ?? 0), 0);
+        const totalRequested = Object.values(offer.requesting).reduce((sum, amount) => sum + (amount ?? 0), 0);
+        if (totalOffered <= 0 || totalRequested <= 0)
+            return false;
+        const botDelta = this.emptyResources();
+        const proposerDelta = this.emptyResources();
+        for (const [res, amount] of Object.entries(offer.offering)) {
+            const resource = res;
+            botDelta[resource] += amount ?? 0;
+            proposerDelta[resource] -= amount ?? 0;
+        }
+        for (const [res, amount] of Object.entries(offer.requesting)) {
+            const resource = res;
+            botDelta[resource] -= amount ?? 0;
+            proposerDelta[resource] += amount ?? 0;
+        }
+        const botBefore = { ...bot.resources };
+        const botAfter = this.applyResourceDelta(bot.resources, botDelta);
+        const proposerBefore = { ...proposer.resources };
+        const proposerAfter = this.applyResourceDelta(proposer.resources, proposerDelta);
+        if (!botAfter || !proposerAfter)
+            return false;
+        const botPlanGain = this.tradePlanScore(botAfter) - this.tradePlanScore(botBefore);
+        const proposerPlanGain = this.tradePlanScore(proposerAfter) - this.tradePlanScore(proposerBefore);
+        let getScore = 0;
+        let giveScore = 0;
         for (const [res, amount] of Object.entries(offer.offering)) {
             if (amount)
-                getScore += valueForBot(res, amount);
+                getScore += this.tradeResourceValue(botBefore, res) * amount;
         }
         for (const [res, amount] of Object.entries(offer.requesting)) {
             if (amount)
-                giveScore += valueForBot(res, amount);
+                giveScore += this.tradeResourceValue(botBefore, res) * amount;
         }
-        // Very restrictive: bot only accepts if it gets ≥50% more value than it gives
-        return getScore >= giveScore * 1.5;
+        const proposerVp = proposer.score
+            + (this.longestRoadHolder === proposer.id ? 2 : 0)
+            + (this.largestArmyHolder === proposer.id ? 2 : 0)
+            + proposer.devCards.filter(card => card.type === 'victoryPoint').length;
+        if (proposerVp >= 8 && proposerPlanGain > botPlanGain)
+            return false;
+        const givesCriticalCityCard = ((offer.requesting.wheat ?? 0) + (offer.requesting.ore ?? 0)) > 0
+            && bot.resources.wheat >= 1
+            && bot.resources.ore >= 2
+            && botPlanGain < 10;
+        if (givesCriticalCityCard)
+            return false;
+        const botNetCards = totalOffered - totalRequested;
+        if (botNetCards < 0 && botPlanGain <= 0)
+            return false;
+        if (botPlanGain >= 8 && proposerPlanGain <= botPlanGain)
+            return true;
+        const requiredEdge = proposerPlanGain > botPlanGain ? 1.75 : 1.35;
+        if (getScore < giveScore * requiredEdge)
+            return false;
+        if (proposerPlanGain >= 8 && botPlanGain < 8)
+            return false;
+        return true;
+    }
+    emptyResources() {
+        return { wood: 0, brick: 0, sheep: 0, wheat: 0, ore: 0 };
+    }
+    applyResourceDelta(resources, delta) {
+        const next = { ...resources };
+        for (const resource of Object.keys(next)) {
+            next[resource] += delta[resource];
+            if (next[resource] < 0)
+                return null;
+        }
+        return next;
+    }
+    tradePlanScore(resources) {
+        let score = 0;
+        if (this.canAffordResources(resources, BUILD_COSTS.city))
+            score += 12;
+        if (this.canAffordResources(resources, BUILD_COSTS.settlement))
+            score += 9;
+        if (this.canAffordResources(resources, BUILD_COSTS.devCard))
+            score += 5;
+        if (this.canAffordResources(resources, BUILD_COSTS.road))
+            score += 4;
+        return score;
+    }
+    canAffordResources(resources, cost) {
+        return Object.keys(cost).every(resource => resources[resource] >= cost[resource]);
+    }
+    tradeResourceValue(resources, resource) {
+        const buildPlans = [
+            { cost: BUILD_COSTS.city, weight: 7 },
+            { cost: BUILD_COSTS.settlement, weight: 5 },
+            { cost: BUILD_COSTS.devCard, weight: 3 },
+            { cost: BUILD_COSTS.road, weight: 2 },
+        ];
+        let value = 1;
+        for (const plan of buildPlans) {
+            const needed = plan.cost[resource] - resources[resource];
+            if (needed > 0) {
+                const missingTotal = Object.keys(plan.cost)
+                    .reduce((sum, res) => sum + Math.max(0, plan.cost[res] - resources[res]), 0);
+                value += plan.weight / Math.max(1, missingTotal);
+            }
+        }
+        value += Math.max(0, 2 - resources[resource]) * 0.45;
+        return value;
     }
     getBotTradeOffer(botId) {
         const p = this.players[botId];
@@ -1079,7 +1442,7 @@ class GameEngine {
             this.longestRoadHolder = newHolder;
             this.longestRoadLength = newLength;
             if (newHolder) {
-                this.addLog(`🛤️ ${this.playerName(newHolder)} has Longest Road (${newLength})`);
+                this.addLog(`🛤️ ${this.playerName(newHolder)} has ${this.expansion === 'seafarers' ? 'Longest Trade Route' : 'Longest Road'} (${newLength})`);
             }
         }
         else {
@@ -1087,9 +1450,13 @@ class GameEngine {
         }
     }
     calcLongestRoadForPlayer(playerId) {
-        // Build adjacency list from this player's roads
+        // Build adjacency list from this player's roads and, in Seafarers, ships.
         const adj = {};
-        for (const [edgeId, owner] of Object.entries(this.roads)) {
+        const routeEntries = [
+            ...Object.entries(this.roads),
+            ...(this.expansion === 'seafarers' ? Object.entries(this.ships) : []),
+        ];
+        for (const [edgeId, owner] of routeEntries) {
             if (owner !== playerId)
                 continue;
             const [a, b] = edgeId.split(':');
@@ -1158,7 +1525,8 @@ class GameEngine {
         if (this.largestArmyHolder === userId)
             vp += 2;
         vp += p.devCards.filter(c => c.type === 'victoryPoint').length;
-        if (vp >= 10) {
+        const targetVp = this.expansion === 'seafarers' ? 13 : 10;
+        if (vp >= targetVp) {
             this.phase = 'GAME_OVER';
             this.winner = userId;
             this.finishedAt = new Date().toISOString();
@@ -1535,9 +1903,150 @@ class GameEngine {
             expectedAction: this.getSetupExpectedAction(),
         };
     }
+    getValidMovesForPlayer(userId) {
+        const player = this.players[userId];
+        if (!player)
+            return { settlements: [], roads: [], ships: [], movableShips: [], cities: [], robberHexes: [] };
+        return {
+            settlements: this.getValidSettlementMoves(userId),
+            roads: this.getValidRoadMoves(userId),
+            ships: this.getValidShipMoves(userId),
+            movableShips: this.getMovableShips(userId),
+            cities: this.getValidCityMoves(userId),
+            robberHexes: this.getValidRobberHexMoves(userId),
+        };
+    }
+    getValidSettlementMoves(userId) {
+        const player = this.players[userId];
+        if (!player)
+            return [];
+        const setup = this.phase === 'SETUP_R1' || this.phase === 'SETUP_R2';
+        if (setup && (this.getSetupCurrentPlayer() !== userId || this.getSetupExpectedAction() !== 'settlement'))
+            return [];
+        if (!setup) {
+            if (this.phase !== 'MAIN_GAME' || this.turnPhase !== 'FREE_ACTION' || this.playerOrder[this.currentTurnIndex] !== userId)
+                return [];
+            const settlementCount = Object.values(this.buildings).filter(b => b.owner === userId && b.type === 'settlement').length;
+            if (settlementCount >= PIECE_LIMITS.settlement || !this.canAfford(player, BUILD_COSTS.settlement))
+                return [];
+        }
+        return Object.keys(this.adjacencyMap).filter(vertexId => {
+            if (this.buildings[vertexId])
+                return false;
+            if (setup && !this.interiorVertices.has(vertexId))
+                return false;
+            if ((this.adjacencyMap[vertexId] || []).some(neighborId => this.buildings[neighborId]))
+                return false;
+            if (setup)
+                return true;
+            return Object.entries(this.roads).some(([edgeId, ownerId]) => ownerId === userId && edgeId.split(':').includes(vertexId));
+        });
+    }
+    getValidRoadMoves(userId) {
+        const player = this.players[userId];
+        if (!player)
+            return [];
+        const setup = this.phase === 'SETUP_R1' || this.phase === 'SETUP_R2';
+        if (setup && (this.getSetupCurrentPlayer() !== userId || this.getSetupExpectedAction() !== 'road'))
+            return [];
+        if (!setup) {
+            if (this.phase !== 'MAIN_GAME' || this.playerOrder[this.currentTurnIndex] !== userId)
+                return [];
+            const roadCount = Object.values(this.roads).filter(owner => owner === userId).length;
+            if (roadCount >= PIECE_LIMITS.road)
+                return [];
+            if (this.roadBuildingRemaining <= 0 && (this.turnPhase !== 'FREE_ACTION' || !this.canAfford(player, BUILD_COSTS.road)))
+                return [];
+        }
+        const setupPlacements = setup ? this.setupSettlements.filter(placement => placement.playerId === userId) : [];
+        const lastSetupSettlement = setupPlacements.length > 0 ? setupPlacements[setupPlacements.length - 1].vertexId : null;
+        return this.getAllEdges().filter(edgeId => {
+            if (this.roads[edgeId])
+                return false;
+            if (this.ships[edgeId])
+                return false;
+            if (!this.isLandRoadEdge(edgeId))
+                return false;
+            const [vA, vB] = edgeId.split(':');
+            if (setup) {
+                return Boolean(lastSetupSettlement && (vA === lastSetupSettlement || vB === lastSetupSettlement));
+            }
+            const hasConnectingBuilding = this.buildings[vA]?.owner === userId || this.buildings[vB]?.owner === userId;
+            const hasConnectingRoad = Object.entries(this.roads).some(([id, ownerId]) => {
+                if (ownerId !== userId)
+                    return false;
+                const [oA, oB] = id.split(':');
+                const touchesA = (oA === vA || oB === vA) && !this.isBlockedByOpponent(vA, userId);
+                const touchesB = (oA === vB || oB === vB) && !this.isBlockedByOpponent(vB, userId);
+                return touchesA || touchesB;
+            });
+            return hasConnectingBuilding || hasConnectingRoad;
+        });
+    }
+    getValidShipMoves(userId) {
+        if (this.expansion !== 'seafarers')
+            return [];
+        const player = this.players[userId];
+        if (!player)
+            return [];
+        const setup = this.phase === 'SETUP_R1' || this.phase === 'SETUP_R2';
+        if (setup && (this.getSetupCurrentPlayer() !== userId || this.getSetupExpectedAction() !== 'road'))
+            return [];
+        if (!setup) {
+            if (this.phase !== 'MAIN_GAME' || this.playerOrder[this.currentTurnIndex] !== userId)
+                return [];
+            const shipCount = Object.values(this.ships).filter(owner => owner === userId).length;
+            if (shipCount >= 15)
+                return [];
+            if (this.roadBuildingRemaining <= 0 && (this.turnPhase !== 'FREE_ACTION' || !this.canAfford(player, BUILD_COSTS.ship)))
+                return [];
+        }
+        const setupPlacements = setup ? this.setupSettlements.filter(placement => placement.playerId === userId) : [];
+        const lastSetupSettlement = setupPlacements.length > 0 ? setupPlacements[setupPlacements.length - 1].vertexId : null;
+        return this.getAllEdges().filter(edgeId => {
+            if (this.validateShipDestination(userId, edgeId))
+                return false;
+            if (!setup)
+                return true;
+            const [vA, vB] = edgeId.split(':');
+            return Boolean(lastSetupSettlement && (vA === lastSetupSettlement || vB === lastSetupSettlement));
+        });
+    }
+    getMovableShips(userId) {
+        if (this.expansion !== 'seafarers')
+            return [];
+        if (this.phase !== 'MAIN_GAME' || this.turnPhase !== 'FREE_ACTION' || this.playerOrder[this.currentTurnIndex] !== userId || this.movedShipThisTurn)
+            return [];
+        return Object.entries(this.ships)
+            .filter(([edgeId, owner]) => owner === userId && this.shipBuiltOnTurn[edgeId] !== this.turnNumber && this.isMovableShip(userId, edgeId))
+            .map(([edgeId]) => edgeId);
+    }
+    getValidCityMoves(userId) {
+        const player = this.players[userId];
+        if (!player)
+            return [];
+        if (this.phase !== 'MAIN_GAME' || this.turnPhase !== 'FREE_ACTION' || this.playerOrder[this.currentTurnIndex] !== userId)
+            return [];
+        const cityCount = Object.values(this.buildings).filter(b => b.owner === userId && b.type === 'city').length;
+        if (cityCount >= PIECE_LIMITS.city || !this.canAfford(player, BUILD_COSTS.city))
+            return [];
+        return Object.entries(this.buildings)
+            .filter(([, building]) => building.owner === userId && building.type === 'settlement')
+            .map(([vertexId]) => vertexId);
+    }
+    getValidRobberHexMoves(userId) {
+        if (this.phase !== 'MAIN_GAME' || this.turnPhase !== 'ROBBER_MOVE' || this.playerOrder[this.currentTurnIndex] !== userId)
+            return [];
+        return this.board
+            .filter(hex => this.expansion === 'seafarers' || hex.type !== 'sea')
+            .map(hex => `${hex.q},${hex.r}`)
+            .filter(hexCoord => hexCoord !== this.robberHex && hexCoord !== this.pirateHex);
+    }
     getState() {
+        const validMoves = Object.fromEntries(this.playerOrder.map(playerId => [playerId, this.getValidMovesForPlayer(playerId)]));
         return {
             snapshotVersion: GAME_SNAPSHOT_VERSION,
+            expansion: this.expansion,
             phase: this.phase,
             turnPhase: this.turnPhase,
             setupTurnIndex: this.setupTurnIndex,
@@ -1551,8 +2060,12 @@ class GameEngine {
             lastDiceYields: this.lastDiceYields,
             buildings: this.buildings,
             roads: this.roads,
+            ships: this.ships,
+            shipBuiltOnTurn: this.shipBuiltOnTurn,
             robberHex: this.robberHex,
+            pirateHex: this.pirateHex,
             playersWhoMustDiscard: this.playersWhoMustDiscard,
+            pendingGoldChoices: this.pendingGoldChoices,
             devCardDeck: this.devCardDeck,
             devCardDeckSize: this.devCardDeck.length,
             longestRoadHolder: this.longestRoadHolder,
@@ -1564,11 +2077,14 @@ class GameEngine {
             winner: this.winner,
             setupInfo: this.getSetupInfo(),
             roadBuildingRemaining: this.roadBuildingRemaining,
+            movedShipThisTurn: this.movedShipThisTurn,
+            turnNumber: this.turnNumber,
             lastEvent: this.lastEvent,
             setupSettlements: this.setupSettlements,
             startedAt: this.startedAt,
             finishedAt: this.finishedAt,
             actionJournal: this.actionJournal,
+            validMoves,
         };
     }
 }

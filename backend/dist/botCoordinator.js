@@ -2,6 +2,12 @@
 Object.defineProperty(exports, "__esModule", { value: true });
 exports.BotCoordinator = void 0;
 const gameEngine_1 = require("./gameEngine");
+const BOT_BUILD_COSTS = {
+    settlement: { wood: 1, brick: 1, sheep: 1, wheat: 1, ore: 0 },
+    city: { wood: 0, brick: 0, sheep: 0, wheat: 2, ore: 3 },
+    road: { wood: 1, brick: 1, sheep: 0, wheat: 0, ore: 0 },
+    devCard: { wood: 0, brick: 0, sheep: 1, wheat: 1, ore: 1 },
+};
 class BotCoordinator {
     performSetup(engine, botId) {
         const setupInfo = engine.getSetupInfo();
@@ -35,6 +41,13 @@ class BotCoordinator {
             if (bestHex)
                 engine.moveRobber(botId, bestHex, victim);
             if (engine.phase === 'GAME_OVER')
+                return;
+        }
+        if (engine.turnPhase === 'GOLD_CHOICE') {
+            while ((engine.pendingGoldChoices[botId] || 0) > 0) {
+                engine.chooseGoldResource(botId, this.getMostScarceNeededResource(engine, botId) || 'ore');
+            }
+            if (engine.turnPhase !== 'FREE_ACTION')
                 return;
         }
         if (engine.turnPhase !== 'FREE_ACTION')
@@ -227,14 +240,19 @@ class BotCoordinator {
     }
     getWantedResources(engine, botId) {
         const player = engine.players[botId];
-        const wanted = [
-            { resource: 'wheat', score: player.resources.wheat < 2 ? 4 : 1 },
-            { resource: 'ore', score: player.resources.ore < 3 ? 4 : 1 },
-            { resource: 'wood', score: player.resources.wood === 0 ? 3 : 0 },
-            { resource: 'brick', score: player.resources.brick === 0 ? 3 : 0 },
-            { resource: 'sheep', score: player.resources.sheep === 0 ? 2 : 0 },
-        ];
-        return wanted.sort((a, b) => b.score - a.score).map((entry) => entry.resource);
+        const resources = ['wood', 'brick', 'sheep', 'wheat', 'ore'];
+        const currentPlanScore = this.planScore(player.resources);
+        const wanted = resources.map((resource) => {
+            const nextResources = { ...player.resources, [resource]: player.resources[resource] + 1 };
+            return {
+                resource,
+                score: this.resourceNeedValue(player.resources, resource) + Math.max(0, this.planScore(nextResources) - currentPlanScore),
+            };
+        });
+        return wanted
+            .filter((entry) => entry.score > 0)
+            .sort((a, b) => b.score - a.score)
+            .map((entry) => entry.resource);
     }
     getMostScarceNeededResource(engine, botId) {
         return this.getWantedResources(engine, botId)[0] ?? null;
@@ -248,14 +266,54 @@ class BotCoordinator {
     }
     suggestPlayerTrade(engine, botId) {
         const player = engine.players[botId];
-        const offer = ['wood', 'brick', 'sheep', 'wheat', 'ore'].find((resource) => player.resources[resource] >= 3);
-        const request = this.getWantedResources(engine, botId).find((resource) => resource !== offer);
+        const wanted = this.getWantedResources(engine, botId);
+        const surplus = ['wood', 'brick', 'sheep', 'wheat', 'ore']
+            .filter((resource) => player.resources[resource] >= 3)
+            .sort((left, right) => this.resourceNeedValue(player.resources, left) - this.resourceNeedValue(player.resources, right));
+        const offer = surplus[0];
+        const request = wanted.find((resource) => resource !== offer
+            && this.resourceNeedValue(player.resources, resource) > this.resourceNeedValue(player.resources, offer) + 0.75
+            && engine.playerOrder.some((pid) => pid !== botId && engine.players[pid].resources[resource] > 0));
         if (!offer || !request)
             return null;
         return {
             offering: { [offer]: 2 },
             requesting: { [request]: 1 },
         };
+    }
+    planScore(resources) {
+        let score = 0;
+        if (this.canAfford(resources, BOT_BUILD_COSTS.city))
+            score += 12;
+        if (this.canAfford(resources, BOT_BUILD_COSTS.settlement))
+            score += 9;
+        if (this.canAfford(resources, BOT_BUILD_COSTS.devCard))
+            score += 5;
+        if (this.canAfford(resources, BOT_BUILD_COSTS.road))
+            score += 4;
+        return score;
+    }
+    canAfford(resources, cost) {
+        return Object.keys(cost).every((resource) => resources[resource] >= cost[resource]);
+    }
+    resourceNeedValue(resources, resource) {
+        const buildPlans = [
+            { cost: BOT_BUILD_COSTS.city, weight: 7 },
+            { cost: BOT_BUILD_COSTS.settlement, weight: 5 },
+            { cost: BOT_BUILD_COSTS.devCard, weight: 3 },
+            { cost: BOT_BUILD_COSTS.road, weight: 2 },
+        ];
+        let value = 0;
+        for (const plan of buildPlans) {
+            const missingForResource = plan.cost[resource] - resources[resource];
+            if (missingForResource <= 0)
+                continue;
+            const missingTotal = Object.keys(plan.cost)
+                .reduce((sum, res) => sum + Math.max(0, plan.cost[res] - resources[res]), 0);
+            value += plan.weight / Math.max(1, missingTotal);
+        }
+        value += Math.max(0, 2 - resources[resource]) * 0.35;
+        return value;
     }
 }
 exports.BotCoordinator = BotCoordinator;

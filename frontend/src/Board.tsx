@@ -1,5 +1,5 @@
 import { motion } from 'framer-motion';
-import { useRef, useEffect, useState } from 'react';
+import { useRef, useEffect, useState, useMemo } from 'react';
 import { type GameState } from './App';
 
 export interface HexData {
@@ -22,8 +22,17 @@ interface BoardProps {
   onEdgeClick: (edgeId: string) => void;
   onHexClick: (hexCoord: string) => void;
   robberHex: string | null;
-  buildMode: 'settlement' | 'road' | 'city' | null;
+  pirateHex?: string | null;
+  buildMode: 'settlement' | 'road' | 'ship' | 'moveShip' | 'city' | null;
   setupHighlight: string | null;
+  validMoves?: {
+    settlements: string[];
+    roads: string[];
+    ships: string[];
+    movableShips: string[];
+    cities: string[];
+    robberHexes: string[];
+  };
   currentPlayerColor?: string;
 }
 
@@ -94,11 +103,22 @@ function RoadSVG({ color, length, ghost = false }: { color: string; length: numb
   );
 }
 
+function ShipSVG({ color, length, ghost = false }: { color: string; length: number; ghost?: boolean }) {
+  const opacity = ghost ? 0.48 : 1;
+  return (
+    <svg width={length} height="24" viewBox={`0 0 ${length} 24`} style={{ opacity, filter: ghost ? 'none' : 'drop-shadow(1px 3px 4px rgba(0,0,0,0.65))', display: 'block' }}>
+      <path d={`M4 15 Q${length / 2} 24 ${length - 4} 15 L${length - 10} 21 L10 21 Z`} fill={color} stroke="rgba(255,255,255,0.78)" strokeWidth="1.4" />
+      <path d={`M${length / 2} 3 L${length / 2} 18`} stroke="rgba(255,255,255,0.9)" strokeWidth="2" />
+      <path d={`M${length / 2 + 2} 5 L${length / 2 + 2} 15 L${length / 2 + 18} 15 Z`} fill="rgba(255,255,255,0.72)" />
+    </svg>
+  );
+}
+
 // ═══════════════════════════════════════════════════════════
 //  BOARD COMPONENT
 // ═══════════════════════════════════════════════════════════
 
-export function Board({ hexes, ports, gameState, onVertexClick, onEdgeClick, onHexClick, robberHex, buildMode, setupHighlight, currentPlayerColor }: BoardProps) {
+export function Board({ hexes, ports, gameState, onVertexClick, onEdgeClick, onHexClick, robberHex, pirateHex, buildMode, setupHighlight, validMoves, currentPlayerColor }: BoardProps) {
   const containerRef = useRef<HTMLDivElement>(null);
   const [scale, setScale] = useState(1);
   const [hoveredVertex, setHoveredVertex] = useState<string | null>(null);
@@ -124,45 +144,55 @@ export function Board({ hexes, ports, gameState, onVertexClick, onEdgeClick, onH
       if (!containerRef.current) return;
       const cw = containerRef.current.clientWidth;
       const ch = containerRef.current.clientHeight;
-      const boardW = 1100;
-      const boardH = 1000;
+      const isSeafarersBoard = hexes.length > 25;
+      const boardW = isSeafarersBoard ? 1500 : 1100;
+      const boardH = isSeafarersBoard ? 1360 : 1000;
       const s = Math.min(cw / boardW, ch / boardH, 1.2);
       setScale(Math.max(s, 0.3));
     }
     handleResize();
     window.addEventListener('resize', handleResize);
     return () => window.removeEventListener('resize', handleResize);
-  }, []);
+  }, [hexes.length]);
 
-  const allVertices: Record<string, { id: string; x: number; y: number }> = {};
-  const edgesMap = new Map<string, { id: string; x: number; y: number; angle: number; len: number }>();
+  const { allVertices, edges } = useMemo(() => {
+    const vertices: Record<string, { id: string; x: number; y: number }> = {};
+    const edgeMap = new Map<string, { id: string; x: number; y: number; angle: number; len: number }>();
 
-  hexes.forEach(hex => {
-    const { x, y } = getPixelPos(hex.q, hex.r);
-    const corners = getVerticesForHex(x, y);
-    corners.forEach(c => allVertices[c.id] = c);
-    for (let i = 0; i < 6; i++) {
-      const c1 = corners[i], c2 = corners[(i + 1) % 6];
-      const eid = [c1.id, c2.id].sort().join(':');
-      if (!edgesMap.has(eid)) {
-        edgesMap.set(eid, {
-          id: eid,
-          x: (c1.x + c2.x) / 2,
-          y: (c1.y + c2.y) / 2,
-          angle: Math.atan2(c2.y - c1.y, c2.x - c1.x) * (180 / Math.PI),
-          len: Math.hypot(c2.x - c1.x, c2.y - c1.y),
-        });
+    hexes.forEach(hex => {
+      const { x, y } = getPixelPos(hex.q, hex.r);
+      const corners = getVerticesForHex(x, y);
+      corners.forEach(c => vertices[c.id] = c);
+      for (let i = 0; i < 6; i++) {
+        const c1 = corners[i], c2 = corners[(i + 1) % 6];
+        const eid = [c1.id, c2.id].sort().join(':');
+        if (!edgeMap.has(eid)) {
+          edgeMap.set(eid, {
+            id: eid,
+            x: (c1.x + c2.x) / 2,
+            y: (c1.y + c2.y) / 2,
+            angle: Math.atan2(c2.y - c1.y, c2.x - c1.x) * (180 / Math.PI),
+            len: Math.hypot(c2.x - c1.x, c2.y - c1.y),
+          });
+        }
       }
-    }
-  });
+    });
+
+    return { allVertices: vertices, edges: Array.from(edgeMap.values()) };
+  }, [hexes]);
 
   const isRobberMove = gameState?.turnPhase === 'ROBBER_MOVE';
   const canPlaceSettlement = buildMode === 'settlement' || setupHighlight === 'settlement';
   const canPlaceCity = buildMode === 'city';
-  const canPlaceRoad = buildMode === 'road' || (gameState?.roadBuildingRemaining ?? 0) > 0 || setupHighlight === 'road';
-  const showVertexHover = canPlaceSettlement || canPlaceCity;
+  const canPlaceRoad = buildMode === 'road' || buildMode === 'ship' || buildMode === 'moveShip' || (gameState?.roadBuildingRemaining ?? 0) > 0 || setupHighlight === 'road';
   const showEdgeHover = canPlaceRoad;
   const previewColor = currentPlayerColor || '#ffffff';
+  const validSettlements = validMoves?.settlements ?? [];
+  const validRoads = validMoves?.roads ?? [];
+  const validShips = validMoves?.ships ?? [];
+  const movableShips = validMoves?.movableShips ?? [];
+  const validCities = validMoves?.cities ?? [];
+  const validRobberHexes = validMoves?.robberHexes ?? [];
 
   return (
     <div className="board-wrapper" ref={containerRef}>
@@ -172,7 +202,7 @@ export function Board({ hexes, ports, gameState, onVertexClick, onEdgeClick, onH
         <div className="ocean-water" />
 
         {/* WOODEN BOARD FRAME */}
-        <svg className="board-frame" viewBox="-620 -560 1240 1120" xmlns="http://www.w3.org/2000/svg">
+        <svg className="board-frame" viewBox="-840 -760 1680 1520" xmlns="http://www.w3.org/2000/svg">
           <defs>
             <pattern id="woodTexture" patternUnits="userSpaceOnUse" width="600" height="600">
               <image href="/assets/wood_texture.png" x="0" y="0" width="600" height="600" preserveAspectRatio="none" />
@@ -186,17 +216,17 @@ export function Board({ hexes, ports, gameState, onVertexClick, onEdgeClick, onH
           </defs>
           {/* Solid wooden board tray base */}
           <polygon 
-            points="620,0 310,537 -310,537 -620,0 -310,-537 310,-537"
+            points="820,0 410,710 -410,710 -820,0 -410,-710 410,-710"
             fill="url(#woodTexture)" stroke="#3a1a06" strokeWidth="8"
             filter="url(#frameShadow)"
           />
           {/* Corner ornaments */}
-          <circle cx="620" cy="0" r="14" fill="#d4a853" stroke="#8B5E3C" strokeWidth="4" />
-          <circle cx="310" cy="537" r="14" fill="#d4a853" stroke="#8B5E3C" strokeWidth="4" />
-          <circle cx="-310" cy="537" r="14" fill="#d4a853" stroke="#8B5E3C" strokeWidth="4" />
-          <circle cx="-620" cy="0" r="14" fill="#d4a853" stroke="#8B5E3C" strokeWidth="4" />
-          <circle cx="-310" cy="-537" r="14" fill="#d4a853" stroke="#8B5E3C" strokeWidth="4" />
-          <circle cx="310" cy="-537" r="14" fill="#d4a853" stroke="#8B5E3C" strokeWidth="4" />
+          <circle cx="820" cy="0" r="14" fill="#d4a853" stroke="#8B5E3C" strokeWidth="4" />
+          <circle cx="410" cy="710" r="14" fill="#d4a853" stroke="#8B5E3C" strokeWidth="4" />
+          <circle cx="-410" cy="710" r="14" fill="#d4a853" stroke="#8B5E3C" strokeWidth="4" />
+          <circle cx="-820" cy="0" r="14" fill="#d4a853" stroke="#8B5E3C" strokeWidth="4" />
+          <circle cx="-410" cy="-710" r="14" fill="#d4a853" stroke="#8B5E3C" strokeWidth="4" />
+          <circle cx="410" cy="-710" r="14" fill="#d4a853" stroke="#8B5E3C" strokeWidth="4" />
         </svg>
 
         {/* PORTS */}
@@ -260,16 +290,18 @@ export function Board({ hexes, ports, gameState, onVertexClick, onEdgeClick, onH
           const { x, y } = getPixelPos(hex.q, hex.r);
           const hc = `${hex.q},${hex.r}`;
           const hasRobber = hc === robberHex;
+          const hasPirate = hc === pirateHex;
+          const canMoveRobberHere = isRobberMove && validRobberHexes.includes(hc);
           const dots = hex.number ? (6 - Math.abs(7 - hex.number)) : 0;
 
           return (
             <div key={hc} style={{ position: 'absolute', left: `calc(50% + ${x}px)`, top: `calc(50% + ${y}px)` }}>
               <motion.div
-                className={`hexagon ${hex.type} ${isRobberMove ? 'hex-clickable' : ''}`}
-                style={{ position: 'absolute', marginLeft: '-98px', marginTop: '-113px', cursor: isRobberMove ? 'pointer' : 'default' }}
+                className={`hexagon ${hex.type} ${canMoveRobberHere ? 'hex-clickable valid-target' : ''}`}
+                style={{ position: 'absolute', marginLeft: '-98px', marginTop: '-113px', cursor: canMoveRobberHere ? 'pointer' : 'default' }}
                 initial={{ scale: 0, opacity: 0 }} animate={{ scale: 1, opacity: 1 }}
                 transition={{ delay: idx * 0.03, duration: 0.5, ease: [0.34, 1.56, 0.64, 1] }}
-                onClick={() => isRobberMove && onHexClick(hc)}>
+                onClick={() => canMoveRobberHere && onHexClick(hc)}>
                 {hex.number && (
                   <div className={`token ${hex.number === 6 || hex.number === 8 ? 'high-prob' : ''}`} style={{ position: 'relative', zIndex: 10 }}>
                     <span className="token-number">{hex.number}</span>
@@ -277,16 +309,29 @@ export function Board({ hexes, ports, gameState, onVertexClick, onEdgeClick, onH
                   </div>
                 )}
                 {hasRobber && <div className="robber-icon" style={{ zIndex: 20 }}>🏴‍☠️</div>}
+                {hasPirate && <div className="robber-icon pirate-icon" style={{ zIndex: 20 }}>⛵</div>}
               </motion.div>
             </div>
           );
         })}
 
         {/* ROADS */}
-        {Array.from(edgesMap.values()).map(edge => {
+        {edges.map(edge => {
           const ownerId = gameState?.roads?.[edge.id];
+          const shipOwnerId = gameState?.ships?.[edge.id];
           const ownerColor = ownerId ? gameState?.players[ownerId]?.color : null;
+          const shipOwnerColor = shipOwnerId ? gameState?.players[shipOwnerId]?.color : null;
           const isHovered = hoveredEdge === edge.id;
+          const isValidRoad = validRoads.includes(edge.id);
+          const isValidShip = validShips.includes(edge.id);
+          const isMovableShip = movableShips.includes(edge.id);
+          const canInteractEdge = buildMode === 'ship'
+            ? isValidShip
+            : buildMode === 'moveShip'
+              ? isValidShip || isMovableShip
+              : setupHighlight === 'road'
+                ? isValidRoad || isValidShip
+                : isValidRoad || ((gameState?.roadBuildingRemaining ?? 0) > 0 && isValidShip);
 
           return (
             <div key={edge.id}
@@ -296,9 +341,9 @@ export function Board({ hexes, ports, gameState, onVertexClick, onEdgeClick, onH
                 top: `calc(50% + ${edge.y}px)`,
                 transform: `translate(-50%, -50%) rotate(${edge.angle}deg)`,
               }}
-              onMouseEnter={() => showEdgeHover && !ownerId && setHoveredEdge(edge.id)}
+              onMouseEnter={() => showEdgeHover && canInteractEdge && setHoveredEdge(edge.id)}
               onMouseLeave={() => setHoveredEdge(null)}
-              onClick={() => onEdgeClick(edge.id)}>
+              onClick={() => canInteractEdge && onEdgeClick(edge.id)}>
               
               {ownerId && ownerColor ? (
                 <motion.div
@@ -306,14 +351,22 @@ export function Board({ hexes, ports, gameState, onVertexClick, onEdgeClick, onH
                   transition={{ duration: 0.35, ease: [0.34, 1.56, 0.64, 1] }}>
                   <RoadSVG color={ownerColor} length={edge.len * 0.75} />
                 </motion.div>
+              ) : shipOwnerId && shipOwnerColor ? (
+                <motion.div
+                  initial={{ scaleX: 0 }} animate={{ scaleX: 1 }}
+                  transition={{ duration: 0.35, ease: [0.34, 1.56, 0.64, 1] }}>
+                  <ShipSVG color={shipOwnerColor} length={edge.len * 0.72} />
+                </motion.div>
               ) : (
-                <div style={{ position: 'relative' }} className={showEdgeHover || setupHighlight === 'road' ? 'road-visual road-hover' : ''}>
+                <div style={{ position: 'relative' }} className={showEdgeHover && canInteractEdge ? 'road-visual road-hover valid-target' : ''}>
                   {/* Invisible hit-box area for hovering edges easier */}
                   <div style={{ width: edge.len * 0.6, height: 20, backgroundColor: 'transparent' }} />
                   
-                  {isHovered && showEdgeHover && (
+                  {isHovered && showEdgeHover && canInteractEdge && (
                     <div style={{ position: 'absolute', top: '50%', left: '50%', transform: 'translate(-50%, -50%)' }}>
-                      <RoadSVG color={previewColor} length={edge.len * 0.75} ghost />
+                      {buildMode === 'ship' || (setupHighlight === 'road' && isValidShip)
+                        ? <ShipSVG color={previewColor} length={edge.len * 0.72} ghost />
+                        : <RoadSVG color={previewColor} length={edge.len * 0.75} ghost />}
                     </div>
                   )}
                 </div>
@@ -328,6 +381,9 @@ export function Board({ hexes, ports, gameState, onVertexClick, onEdgeClick, onH
           const color = bld ? gameState?.players[bld.owner]?.color : null;
           const isCity = bld?.type === 'city';
           const isHovered = hoveredVertex === v.id;
+          const isValidSettlement = validSettlements.includes(v.id);
+          const isValidCity = validCities.includes(v.id);
+          const isValidVertex = canPlaceCity ? isValidCity : canPlaceSettlement ? isValidSettlement : false;
 
           return (
             <div key={v.id}
@@ -337,11 +393,11 @@ export function Board({ hexes, ports, gameState, onVertexClick, onEdgeClick, onH
                 top: `calc(50% + ${v.y}px)`,
                 transform: 'translate(-50%, -50%)',
                 zIndex: bld ? 60 : 50,
-                cursor: (showVertexHover || bld) ? 'pointer' : 'default',
+                cursor: isValidVertex ? 'pointer' : 'default',
               }}
-              onMouseEnter={() => showVertexHover && !bld && setHoveredVertex(v.id)}
+              onMouseEnter={() => isValidVertex && setHoveredVertex(v.id)}
               onMouseLeave={() => setHoveredVertex(null)}
-              onClick={() => onVertexClick(v.id)}>
+              onClick={() => isValidVertex && onVertexClick(v.id)}>
 
               {/* Built piece */}
               {bld && color ? (
@@ -358,7 +414,7 @@ export function Board({ hexes, ports, gameState, onVertexClick, onEdgeClick, onH
               ) : (
                 <>
                   {/* Empty vertex dot */}
-                  <div className={`vertex-dot ${showVertexHover ? 'hoverable' : ''} ${setupHighlight === 'settlement' ? 'setup-pulse' : ''}`} />
+                  <div className={`vertex-dot ${isValidVertex ? 'hoverable valid-target' : ''} ${setupHighlight === 'settlement' && isValidSettlement ? 'setup-pulse' : ''}`} />
 
                   {/* Ghost piece preview on hover */}
                   {isHovered && canPlaceSettlement && (

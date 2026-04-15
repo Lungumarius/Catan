@@ -6,7 +6,7 @@ import cors from 'cors';
 import dotenv from 'dotenv';
 import pino from 'pino';
 import { PrismaClient } from '@prisma/client';
-import { generateBoard } from './boardGenerator';
+import { BoardExpansion, generateBoard, generateBoardForExpansion } from './boardGenerator';
 import { BotCoordinator } from './botCoordinator';
 import { GameEngine, GameSnapshot } from './gameEngine';
 import { register, login, verifyToken } from './auth';
@@ -486,7 +486,9 @@ function checkForBotTurn(gameId: string) {
   let botId: string | null = null;
 
   // ROBBER_DISCARD: ANY bot that must discard (regardless of whose turn)
-  if (state.phase === 'MAIN_GAME' && state.turnPhase === 'ROBBER_DISCARD') {
+  if (state.phase === 'MAIN_GAME' && state.turnPhase === 'GOLD_CHOICE') {
+    botId = Object.entries(state.pendingGoldChoices || {}).find(([pid, amount]) => amount > 0 && engine.players[pid]?.isBot)?.[0] || null;
+  } else if (state.phase === 'MAIN_GAME' && state.turnPhase === 'ROBBER_DISCARD') {
     botId = state.playersWhoMustDiscard.find(pid => engine.players[pid]?.isBot) || null;
   } else if (state.phase === 'SETUP_R1' || state.phase === 'SETUP_R2') {
     const cur = state.setupInfo?.currentPlayer;
@@ -550,7 +552,8 @@ io.on('connection', (socket) => {
 
   socket.on('create_lobby', async (data) => {
     logger.info(`Creating lobby for ${data.userId}`);
-    const boardData = generateBoard();
+    const expansion: BoardExpansion = data.expansion === 'seafarers' ? 'seafarers' : 'base';
+    const boardData = generateBoardForExpansion(expansion);
     const engine = new GameEngine();
     engine.setBoard(boardData.hexes, boardData.ports);
     engine.addPlayer(data.userId, data.username);
@@ -728,7 +731,8 @@ io.on('connection', (socket) => {
       return;
     }
 
-    const boardData = generateBoard();
+    const expansion = previousEngine.expansion === 'seafarers' ? 'seafarers' : 'base';
+    const boardData = generateBoardForExpansion(expansion);
     const engine = new GameEngine();
     engine.setBoard(boardData.hexes, boardData.ports);
     engine.addPlayer(data.userId, previousEngine.players[data.userId].username);
@@ -812,6 +816,14 @@ io.on('connection', (socket) => {
     handleAction(socket, data, (engine) => engine.placeRoad(data.userId, data.edgeId));
   });
 
+  socket.on('place_ship', (data) => {
+    handleAction(socket, data, (engine) => engine.placeShip(data.userId, data.edgeId));
+  });
+
+  socket.on('move_ship', (data) => {
+    handleAction(socket, data, (engine) => engine.moveShip(data.userId, data.fromEdgeId, data.toEdgeId));
+  });
+
   socket.on('upgrade_city', (data) => {
     handleAction(socket, data, (engine) => engine.upgradeToCity(data.userId, data.vertexId));
   });
@@ -836,6 +848,10 @@ io.on('connection', (socket) => {
 
   socket.on('move_robber', (data) => {
     handleAction(socket, data, (engine) => engine.moveRobber(data.userId, data.hexCoord, data.stealFrom));
+  });
+
+  socket.on('choose_gold_resource', (data) => {
+    handleAction(socket, data, (engine) => engine.chooseGoldResource(data.userId, data.resource));
   });
 
   // ── P2P TRADE ──

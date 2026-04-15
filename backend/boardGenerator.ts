@@ -8,6 +8,7 @@ const HEX_COUNTS: Record<string, number> = {
 };
 
 const NUMBER_TOKENS = [2, 3, 3, 4, 4, 5, 5, 6, 6, 8, 8, 9, 9, 10, 10, 11, 11, 12];
+const SEAFARERS_NUMBER_TOKENS = [2, 3, 3, 4, 4, 5, 5, 6, 6, 8, 8, 9, 9, 10, 10, 11, 11, 12, 3, 4, 5, 9, 10, 11];
 
 // Official Catan spiral order (clockwise from top-left edge, spiraling inward)
 const SPIRAL_COORDS: [number, number][] = [
@@ -26,6 +27,8 @@ export interface HexagonState {
   type: string;
   number: number | null;
 }
+
+export type BoardExpansion = 'base' | 'seafarers';
 
 export type PortType = 'wood' | 'brick' | 'sheep' | 'wheat' | 'ore' | 'generic';
 
@@ -165,7 +168,7 @@ function generateBalancedTerrain(coords: [number, number][]): HexagonState[] {
  * Uses a swap-based approach: if placing a number would violate the rule,
  * swap it with a future number that doesn't violate.
  */
-function assignBalancedNumbers(hexes: HexagonState[]): void {
+function assignBalancedNumbers(hexes: HexagonState[], tokens = NUMBER_TOKENS): void {
   // Find the desert index
   const desertIdx = hexes.findIndex(h => h.type === 'desert');
 
@@ -177,7 +180,7 @@ function assignBalancedNumbers(hexes: HexagonState[]): void {
   }
 
   // Shuffle the number tokens
-  let numbers = shuffle([...NUMBER_TOKENS]);
+  let numbers = shuffle([...tokens]);
 
   const MAX_RETRIES = 100;
   for (let retry = 0; retry < MAX_RETRIES; retry++) {
@@ -215,7 +218,7 @@ function assignBalancedNumbers(hexes: HexagonState[]): void {
     }
 
     if (valid) return;
-    numbers = shuffle([...NUMBER_TOKENS]);
+    numbers = shuffle([...tokens]);
   }
 
   // Fallback: assign whatever we have
@@ -276,4 +279,79 @@ export function generateBoard(): { hexes: HexagonState[], ports: Port[] } {
   });
 
   return { hexes, ports };
+}
+
+function generateSeafarersTerrain(coords: [number, number][]): HexagonState[] {
+  const landCoords = new Set([
+    '-2,0', '-2,1', '-1,-1', '-1,0', '-1,1', '0,-2', '0,-1', '0,0',
+    '1,-2', '1,-1', '2,-2',
+    '-3,2', '-3,3', '-2,3',
+    '2,-3', '3,-3', '3,-2',
+    '0,2', '1,1', '1,2', '2,0', '2,1',
+  ]);
+  const goldCoords = new Set(['-3,3', '3,-3', '1,2']);
+  const desertCoord = '0,0';
+  const terrainPool = shuffle([
+    'forest', 'forest', 'forest', 'forest', 'forest',
+    'pasture', 'pasture', 'pasture', 'pasture', 'pasture',
+    'field', 'field', 'field', 'field', 'field',
+    'hill', 'hill', 'hill', 'hill',
+    'mountain', 'mountain', 'mountain', 'mountain',
+  ]);
+
+  let terrainIndex = 0;
+  return coords.map(([q, r]) => {
+    const key = `${q},${r}`;
+    if (!landCoords.has(key)) return { q, r, type: 'sea', number: null };
+    if (goldCoords.has(key)) return { q, r, type: 'gold', number: null };
+    if (key === desertCoord) return { q, r, type: 'desert', number: null };
+    return { q, r, type: terrainPool[terrainIndex++] ?? 'forest', number: null };
+  });
+}
+
+export function generateSeafarersBoard(): { hexes: HexagonState[], ports: Port[], expansion: BoardExpansion } {
+  const radius = 3;
+  const coords: [number, number][] = [];
+  for (let q = -radius; q <= radius; q++) {
+    const r1 = Math.max(-radius, -q - radius);
+    const r2 = Math.min(radius, -q + radius);
+    for (let r = r1; r <= r2; r++) {
+      coords.push([q, r]);
+    }
+  }
+
+  const hexes = generateSeafarersTerrain(coords);
+  const numberable = hexes.filter(hex => hex.type !== 'sea' && hex.type !== 'desert');
+  const numbers = shuffle([...SEAFARERS_NUMBER_TOKENS]);
+  numberable.forEach((hex, index) => { hex.number = numbers[index] ?? null; });
+
+  const portConfigs = [
+    { q: 0, r: -3, vIdx: [3, 4], type: 'generic' as PortType },
+    { q: 2, r: -3, vIdx: [4, 5], type: 'wood' as PortType },
+    { q: 3, r: -1, vIdx: [5, 0], type: 'generic' as PortType },
+    { q: 2, r: 1, vIdx: [0, 1], type: 'ore' as PortType },
+    { q: 0, r: 3, vIdx: [1, 2], type: 'generic' as PortType },
+    { q: -2, r: 3, vIdx: [1, 2], type: 'wheat' as PortType },
+    { q: -3, r: 1, vIdx: [2, 3], type: 'sheep' as PortType },
+    { q: -2, r: -1, vIdx: [3, 4], type: 'brick' as PortType },
+    { q: 1, r: -3, vIdx: [4, 5], type: 'generic' as PortType },
+  ];
+
+  const ports: Port[] = portConfigs.map((config, i) => {
+    const { x, y } = getPixelPos(config.q, config.r);
+    const hexVerts = getVerticesForHex(x, y);
+    return {
+      id: `seafarers-port-${i}`,
+      type: config.type,
+      vertices: [hexVerts[config.vIdx[0]], hexVerts[config.vIdx[1]]],
+      q: config.q,
+      r: config.r
+    };
+  });
+
+  return { hexes, ports, expansion: 'seafarers' };
+}
+
+export function generateBoardForExpansion(expansion: BoardExpansion = 'base'): { hexes: HexagonState[], ports: Port[], expansion?: BoardExpansion } {
+  return expansion === 'seafarers' ? generateSeafarersBoard() : { ...generateBoard(), expansion: 'base' };
 }

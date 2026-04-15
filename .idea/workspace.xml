@@ -2,14 +2,11 @@
 <project version="4">
   <component name="ChangeListManager">
     <list default="true" id="c23ce5f5-14f4-495a-b476-18edbebb3a96" name="Changes" comment="">
-      <change beforePath="$PROJECT_DIR$/backend/dist/boardGenerator.js" beforeDir="false" afterPath="$PROJECT_DIR$/backend/dist/boardGenerator.js" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/backend/botCoordinator.ts" beforeDir="false" afterPath="$PROJECT_DIR$/backend/botCoordinator.ts" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/backend/dist/botCoordinator.js" beforeDir="false" afterPath="$PROJECT_DIR$/backend/dist/botCoordinator.js" afterDir="false" />
       <change beforePath="$PROJECT_DIR$/backend/dist/gameEngine.js" beforeDir="false" afterPath="$PROJECT_DIR$/backend/dist/gameEngine.js" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/backend/dist/index.js" beforeDir="false" afterPath="$PROJECT_DIR$/backend/dist/index.js" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/backend/index.ts" beforeDir="false" afterPath="$PROJECT_DIR$/backend/index.ts" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/backend/node_modules/.prisma/client/edge.js" beforeDir="false" afterPath="$PROJECT_DIR$/backend/node_modules/.prisma/client/edge.js" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/backend/node_modules/.prisma/client/index.js" beforeDir="false" afterPath="$PROJECT_DIR$/backend/node_modules/.prisma/client/index.js" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/backend/node_modules/.prisma/client/package.json" beforeDir="false" afterPath="$PROJECT_DIR$/backend/node_modules/.prisma/client/package.json" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/backend/node_modules/.prisma/client/schema.prisma" beforeDir="false" afterPath="$PROJECT_DIR$/backend/node_modules/.prisma/client/schema.prisma" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/backend/gameEngine.ts" beforeDir="false" afterPath="$PROJECT_DIR$/backend/gameEngine.ts" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/frontend/src/App.css" beforeDir="false" afterPath="$PROJECT_DIR$/frontend/src/App.css" afterDir="false" />
       <change beforePath="$PROJECT_DIR$/frontend/src/App.tsx" beforeDir="false" afterPath="$PROJECT_DIR$/frontend/src/App.tsx" afterDir="false" />
     </list>
     <option name="SHOW_DIALOG" value="false" />
@@ -20,10 +17,22 @@
   <component name="Git.Settings">
     <option name="RECENT_GIT_ROOT_PATH" value="$PROJECT_DIR$" />
   </component>
-  <component name="ProjectColorInfo"><![CDATA[{
-  "associatedIndex": 4,
-  "fromUser": false
+  <component name="GitHubPullRequestSearchHistory"><![CDATA[{
+  "lastFilter": {
+    "state": "OPEN",
+    "assignee": "Lungumarius"
+  }
 }]]></component>
+  <component name="GithubPullRequestsUISettings"><![CDATA[{
+  "selectedUrlAndAccountId": {
+    "url": "git@github.com:Lungumarius/Catan.git",
+    "accountId": "2fa76c82-ca3b-4466-bd77-b331589d30ab"
+  }
+}]]></component>
+  <component name="ProjectColorInfo">{
+  &quot;associatedIndex&quot;: 4,
+  &quot;fromUser&quot;: false
+}</component>
   <component name="ProjectId" id="3CJ8V6Yv0fmsycgeR3evsfSi0AA" />
   <component name="ProjectViewState">
     <option name="hideEmptyMiddlePackages" value="true" />
@@ -33,9 +42,11 @@
   "keyToString": {
     "ModuleVcsDetector.initialDetectionPerformed": "true",
     "RunOnceActivity.ShowReadmeOnStart": "true",
+    "RunOnceActivity.git.unshallow": "true",
     "RunOnceActivity.typescript.service.memoryLimit.init": "true",
     "com.intellij.ml.llm.matterhorn.ej.ui.settings.DefaultModelSelectionForGA.v1": "true",
     "git-widget-placeholder": "main",
+    "javascript.preferred.runtime.type.id": "node",
     "junie.onboarding.icon.badge.shown": "true",
     "nodejs_package_manager_path": "npm",
     "project.structure.last.edited": "SDKs",
@@ -43,6 +54,7 @@
     "project.structure.side.proportion": "0.2",
     "settings.editor.selected.configurable": "MavenSettings",
     "to.speed.mode.migration.done": "true",
+    "ts.external.directory.path": "/Users/mariuslungu/Catan/backend/node_modules/typescript/lib",
     "vue.rearranger.settings.migration": "true"
   }
 }]]></component>
@@ -61,7 +73,11 @@
       <option name="presentableId" value="Default" />
       <updated>1763322212612</updated>
       <workItem from="1776092334286" duration="4000" />
+      <workItem from="1776271174715" duration="14000" />
     </task>
     <servers />
+  </component>
+  <component name="TypeScriptGeneratedFilesManager">
+    <option name="version" value="3" />
   </component>
 </project>
